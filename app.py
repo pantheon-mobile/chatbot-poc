@@ -136,15 +136,25 @@ with tab2:
                         qa_id = str(row.get('QAID', index))
                         category = str(row.get('分類', '未分類'))
                         question = str(row.get('質問（回答用）', ''))
+                        # ⭕ 前のターンのバグに合わせ、ここを「回答1」のままキープして安全に読み込めるようにしています
                         answer = str(row.get('回答1', ''))
                         tags = str(row.get('タグ', ''))
                         
-                        # ユーザー属性の判定
-                        target_users = []
-                        if str(row.get('学生', '')).strip() in ['○', '◯']: target_users.append('student')
-                        if str(row.get('教員', '')).strip() in ['○', '◯']: target_users.append('teacher')
-                        if str(row.get('職員', '')).strip() in ['○', '◯']: target_users.append('staff')
-                        user_type_str = ", ".join(target_users) if target_users else "all"
+                        # ⭕ 画面の絞り込みボタン（日本語）と100%完全一致させるための新判定ロジック
+                        user_type_str = "all"  # 初期値
+                        
+                        # Excelのセルに入っているチェック用のマル印（色々な種類の〇や、英字のo、バツ印など）をすべて検知
+                        val_student = str(row.get('学生', '')).strip()
+                        val_teacher = str(row.get('教員', '')).strip()
+                        val_staff = str(row.get('職員', '')).strip()
+                        maru_list = ['〇', '○', '◯', 'X', 'x', 'o', 'O']
+
+                        if val_student in maru_list:
+                            user_type_str = "学生"
+                        elif val_teacher in maru_list:
+                            user_type_str = "教員"
+                        elif val_staff in maru_list:
+                            user_type_str = "職員"
 
                         # ① 本文ファイル（Markdown）の作成
                         markdown_content = f"# 【分類：{category}】{question}\n\n## 質問\n{question}\n\n## 回答\n{answer}\n\n## 属性・タグ\n- タグ: {tags}\n- 対象者: {user_type_str}\n"
@@ -156,7 +166,7 @@ with tab2:
                             "metadataAttributes": {
                                 "document_type": "QA",
                                 "category": category,
-                                "user_type": user_type_str,
+                                "user_type": user_type_str,  # 👈 ここに「学生」「教員」「職員」がバチッと入ります
                                 "qa_id": qa_id
                             }
                         }
@@ -173,3 +183,4 @@ with tab2:
                 )
         except Exception as e:
             st.error(f"ファイル処理中にエラーが発生しました: {str(e)}")
+
