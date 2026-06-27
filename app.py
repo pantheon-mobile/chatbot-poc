@@ -69,8 +69,8 @@ with tab1:
                         'type': 'KNOWLEDGE_BASE',
                         'knowledgeBaseConfiguration': {
                             'knowledgeBaseId': KNOWLEDGE_BASE_ID,
-                            # ⭕ 生のモデルIDを禁止するAWSの最新制限を突破するため、日本国内専用の「JPクロスリージョン推論プロファイル」をセットしました！
-                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-sonnet-4-6'
+                            # ⭕ 長いARNではなく、日本国内専用の「推論プロファイルID」をダイレクトに指定しました！
+                            'modelArn': 'jp.anthropic.claude-sonnet-4-6'
                         }
                     }
                 )
@@ -85,6 +85,7 @@ with tab1:
                 st.error(f"エラーが発生しました: {str(e)}")
                 st.warning("詳細なエラーログ（ここが原因究明のヒントになります）:")
                 st.code(traceback.format_exc())
+
 
 
 # ==========================================
