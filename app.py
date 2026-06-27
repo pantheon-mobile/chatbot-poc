@@ -35,7 +35,12 @@ with tab1:
     st.title("🎓 奨学金Q&A AIアシスタント")
     st.caption("東京理科大学の奨学金業務に関する質問に、規程ベースでお答えします。")
 
-    bedrock_agent_runtime = boto3.client(service_name="bedrock-agent-runtime", region_name="ap-northeast-1")
+    bedrock_agent_runtime = boto3.client(
+        service_name="bedrock-agent-runtime", 
+        region_name="ap-northeast-1",
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+    )
     KNOWLEDGE_BASE_ID = "TZKVQ8D3M6"
 
     if "messages" not in st.session_state:
