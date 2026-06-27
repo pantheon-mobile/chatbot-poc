@@ -35,12 +35,15 @@ with tab1:
     st.title("🎓 奨学金Q&A AIアシスタント")
     st.caption("東京理科大学の奨学金業務に関する質問に、規程ベースでお答えします。")
 
+    # Secretsから子アカウントの鍵を引き抜いて接続
     bedrock_agent_runtime = boto3.client(
         service_name="bedrock-agent-runtime", 
         region_name="ap-northeast-1",
         aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
         aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
     )
+    
+    # ご自身の10桁のナレッジベースID
     KNOWLEDGE_BASE_ID = "TZKVQ8D3M6"
 
     if "messages" not in st.session_state:
@@ -50,7 +53,8 @@ with tab1:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    if user_query := st.chat_input("例：学生寮に入っている場合の申請書類を教えてください", key="chat_input"):
+    # ユーザーからの質問入力
+    if user_query := st.chat_input("例：学生寮に入っている場合の申請書類を教えてください"):
         with st.chat_message("user"):
             st.markdown(user_query)
         st.session_state.messages.append({"role": "user", "content": user_query})
@@ -58,24 +62,46 @@ with tab1:
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             try:
+                # ⭕ AWSのルール通り、Claudeを動かすための最小限のプロンプト定義を追加します
+                custom_prompt = {
+                    "textPromptTemplate": (
+                        "あなたは東京理科大学の奨学金業務をサポートするAIアシスタントです。\n"
+                        "以下の資料に基づいて、ユーザーからの質問に正確かつ丁寧に回答してください。\n"
+                        "資料にない情報は勝手に作らず、「分かりかねます」と答えてください。\n\n"
+                        "【検索された資料】\n$search_results$\n\n"
+                        "【ユーザーからの質問】\n$query$"
+                    )
+                }
+
+                # Amazon Bedrock ナレッジベースを呼び出し
                 response = bedrock_agent_runtime.retrieve_and_generate(
                     input={'text': user_query},
                     retrieveAndGenerateConfiguration={
                         'type': 'KNOWLEDGE_BASE',
                         'knowledgeBaseConfiguration': {
                             'knowledgeBaseId': KNOWLEDGE_BASE_ID,
-                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-v1:0'
+                            # ⭕ 構成図通りの回答生成モデル（Claude 3.5 Sonnet）を指定
+                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0',
+                            # ⭕ プログラム側からプロンプト指示書をガチッと合流させます
+                            'generationConfiguration': {
+                                'promptTemplate': custom_prompt
+                            }
                         }
                     }
                 )
                 ai_answer = response['output']['text']
+                
+                # 正常に回答が取れたときだけ画面に表示して履歴に保存
+                response_placeholder.markdown(ai_answer)
+                st.session_state.messages.append({"role": "assistant", "content": ai_answer})
+
             except Exception as e:
+                # 万が一エラーが起きても安全にキャッチして画面に詳細を吐き出します
+                response_placeholder.error(f"エラーが発生しました: {str(e)}")
                 st.error(f"エラーの概要: {str(e)}")
                 st.warning("詳細なエラーログ（ここが原因究明のヒントになります）:")
                 st.code(traceback.format_exc()) 
-                
-            response_placeholder.markdown(ai_answer)
-            st.session_state.messages.append({"role": "assistant", "content": ai_answer})
+
 
 # ==========================================
 #  タブ2：管理者専用 Excel自動変換ツール
