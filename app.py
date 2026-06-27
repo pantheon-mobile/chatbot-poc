@@ -6,9 +6,9 @@ import io
 import zipfile
 
 # --- 🔒 セキュリティ設定（パスワード） ---
-VALID_PASSWORD = "tus_scholarship_2026"
+VALID_PASSWORD = "hp_chatbot_2026"
 
-st.set_page_config(page_title="東京理科大学 奨学金AI管理システム", page_icon="🎓", layout="wide")
+st.set_page_config(page_title="ハーモニープラス チャットボットPoC", page_icon="🎓", layout="wide")
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
