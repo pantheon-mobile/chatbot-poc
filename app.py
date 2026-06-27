@@ -80,8 +80,8 @@ with tab1:
                         'type': 'KNOWLEDGE_BASE',
                         'knowledgeBaseConfiguration': {
                             'knowledgeBaseId': KNOWLEDGE_BASE_ID,
-                            # ⭕ ロックされた古い旧Sonnet(v1)から、現役の「Claude 3.5 Sonnet v2」へアップデートしました！
-                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0',
+                            # ⭕ AWSの最新仕様に合わせ、生のモデルIDではなく「米国クロスリージョン推論プロファイルID」に書き換えました
+                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0',
                             # 構成図通りのプロンプト指示書を合流させます
                             'generationConfiguration': {
                                 'promptTemplate': custom_prompt
@@ -96,7 +96,7 @@ with tab1:
                 st.session_state.messages.append({"role": "assistant", "content": ai_answer})
 
             except Exception as e:
-                # ⭕ ご希望通り、デバッグ用の詳細ログをここに残しています！無事に動き出したらここを消しましょう
+                # ⭕ まだ完全に動き出すまでは、原因究明用の詳細デバッグログを残しておきます
                 st.error(f"エラーの概要: {str(e)}")
                 st.warning("詳細なエラーログ（ここが原因究明のヒントになります）:")
                 st.code(traceback.format_exc())
