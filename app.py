@@ -62,7 +62,7 @@ with tab1:
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             try:
-                # ⭕ AWSのルール通り、Claudeを動かすための最小限のプロンプト定義を追加します
+                # AWSのルール通り、Claudeを動かすためのプロンプト定義
                 custom_prompt = {
                     "textPromptTemplate": (
                         "あなたは東京理科大学の奨学金業務をサポートするAIアシスタントです。\n"
@@ -80,9 +80,9 @@ with tab1:
                         'type': 'KNOWLEDGE_BASE',
                         'knowledgeBaseConfiguration': {
                             'knowledgeBaseId': KNOWLEDGE_BASE_ID,
-                            # ⭕ 構成図通りの回答生成モデル（Claude 3.5 Sonnet）を指定
-                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0',
-                            # ⭕ プログラム側からプロンプト指示書をガチッと合流させます
+                            # ⭕ ロックされた古い旧Sonnet(v1)から、現役の「Claude 3.5 Sonnet v2」へアップデートしました！
+                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0',
+                            # 構成図通りのプロンプト指示書を合流させます
                             'generationConfiguration': {
                                 'promptTemplate': custom_prompt
                             }
@@ -96,11 +96,11 @@ with tab1:
                 st.session_state.messages.append({"role": "assistant", "content": ai_answer})
 
             except Exception as e:
-                # 万が一エラーが起きても安全にキャッチして画面に詳細を吐き出します
-                response_placeholder.error(f"エラーが発生しました: {str(e)}")
+                # ⭕ ご希望通り、デバッグ用の詳細ログをここに残しています！無事に動き出したらここを消しましょう
                 st.error(f"エラーの概要: {str(e)}")
                 st.warning("詳細なエラーログ（ここが原因究明のヒントになります）:")
-                st.code(traceback.format_exc()) 
+                st.code(traceback.format_exc())
+
 
 
 # ==========================================
