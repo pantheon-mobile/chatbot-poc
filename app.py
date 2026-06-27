@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import io
 import zipfile
+import traceback 
 
 # --- 🔒 セキュリティ設定（パスワード） ---
 VALID_PASSWORD = "hp_chatbot_2026"
@@ -64,7 +65,9 @@ with tab1:
                 )
                 ai_answer = response['output']['text']
             except Exception as e:
-                ai_answer = f"エラーが発生しました: {str(e)}"
+                st.error(f"エラーの概要: {str(e)}")
+                st.warning("詳細なエラーログ（ここが原因究明のヒントになります）:")
+                st.code(traceback.format_exc()) 
                 
             response_placeholder.markdown(ai_answer)
             st.session_state.messages.append({"role": "assistant", "content": ai_answer})
