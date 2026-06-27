@@ -62,15 +62,15 @@ with tab1:
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             try:
-                # ⭕ AWS公式のサンプルコードに100%完全準拠した、最も美しく正しい呼び出し構成です
+                # Amazon Bedrock ナレッジベースを呼び出し
                 response = bedrock_agent_runtime.retrieve_and_generate(
                     input={'text': user_query},
                     retrieveAndGenerateConfiguration={
                         'type': 'KNOWLEDGE_BASE',
                         'knowledgeBaseConfiguration': {
                             'knowledgeBaseId': KNOWLEDGE_BASE_ID,
-                            # ⭕ AWSが画面上で指定した「完璧な正解のモデルARN」に完全変更しました！
-                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-sonnet-4-6'
+                            # ⭕ 生のモデルIDを禁止するAWSの最新制限を突破するため、日本国内専用の「JPクロスリージョン推論プロファイル」をセットしました！
+                            'modelArn': 'arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-sonnet-4-6'
                         }
                     }
                 )
@@ -85,8 +85,6 @@ with tab1:
                 st.error(f"エラーが発生しました: {str(e)}")
                 st.warning("詳細なエラーログ（ここが原因究明のヒントになります）:")
                 st.code(traceback.format_exc())
-
-
 
 
 # ==========================================
