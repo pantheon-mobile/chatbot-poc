@@ -136,23 +136,29 @@ with tab2:
             st.dataframe(df.head(3)) # 先頭3行をプレビュー
 
             if st.button("🚀 変換を実行してZIPを作成"):
+                # ⭕ 変換ボタンが押された瞬間の現在日時を「yyyyMMddHHmmss」の14桁の文字列として取得します
+                from datetime import datetime
+                current_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+
                 # メモリ上にZIPファイルを展開する準備
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                     
-                    for index, row in df.iterrows():
-                        # セルが空の場合の対策を考慮しつつ文字列化
-                        qa_id = str(row.get('QAID', index))
+                    # ⭕ ループ処理の中で行番号(i)をカウントし、3桁の連番（000, 001, 002...）を作ります
+                    for i, (index, row) in enumerate(df.iterrows()):
+                        
+                        # ⭕ 日時14桁 + 3桁の連番を組み合わせて、指定通りの17桁のIDを生成！
+                        serial_suffix = f"{i:03d}"  # 3桁固定
+                        qa_id = f"{current_timestamp}{serial_suffix}"
+                        
                         category = str(row.get('分類', '未分類'))
                         question = str(row.get('質問（回答用）', ''))
-                        # ⭕ 前のターンのバグに合わせ、ここを「回答1」のままキープして安全に読み込めるようにしています
                         answer = str(row.get('回答1', ''))
                         tags = str(row.get('タグ', ''))
                         
-                        # ⭕ 画面の絞り込みボタン（日本語）と100%完全一致させるための新判定ロジック
+                        # 画面の絞り込みボタン（日本語）と連動させるための判定ロジック
                         user_type_str = "all"  # 初期値
                         
-                        # Excelのセルに入っているチェック用のマル印（色々な種類の〇や、英字のo、バツ印など）をすべて検知
                         val_student = str(row.get('学生', '')).strip()
                         val_teacher = str(row.get('教員', '')).strip()
                         val_staff = str(row.get('職員', '')).strip()
@@ -167,6 +173,7 @@ with tab2:
 
                         # ① 本文ファイル（Markdown）の作成
                         markdown_content = f"# 【分類：{category}】{question}\n\n## 質問\n{question}\n\n## 回答\n{answer}\n\n## 属性・タグ\n- タグ: {tags}\n- 対象者: {user_type_str}\n"
+                        # ⭕ ファイル名も、指定通りの「qa_20260628174900000.txt」の形に自動で切り替わります
                         txt_filename = f"qa_{qa_id}.txt"
                         zip_file.writestr(txt_filename, markdown_content)
 
@@ -175,10 +182,11 @@ with tab2:
                             "metadataAttributes": {
                                 "document_type": "QA",
                                 "category": category,
-                                "user_type": user_type_str,  # 👈 ここに「学生」「教員」「職員」がバチッと入ります
-                                "qa_id": qa_id
+                                "user_type": user_type_str,
+                                "qa_id": qa_id  # 👈 JSONの内部IDも17桁の連番と連動させます
                             }
                         }
+                        # ⭕ メタデータJSONのファイル名も、テキスト名と1文字の狂いもなく完全一致します
                         json_filename = f"qa_{qa_id}.txt.metadata.json"
                         zip_file.writestr(json_filename, json.dumps(metadata, ensure_ascii=False, indent=2))
 
@@ -192,4 +200,5 @@ with tab2:
                 )
         except Exception as e:
             st.error(f"ファイル処理中にエラーが発生しました: {str(e)}")
+
 
