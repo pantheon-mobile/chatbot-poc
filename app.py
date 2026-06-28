@@ -106,8 +106,7 @@ with tab1:
                         'textInferenceConfig': {
                             'maxTokens': 4000
                         }
-                    },
-                    'forwardToUser': True, 
+                    }, 
                     'promptTemplate': {
                         'textPromptTemplate': (
                             "あなたは大学の奨学金業務のベテラン職員です。提供された検索結果（マニュアルや規程の資料）のみに基づいて、ユーザーの質問に正確に答えてください。\n\n"
