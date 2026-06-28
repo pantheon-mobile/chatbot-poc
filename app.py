@@ -60,8 +60,8 @@ with tab1:
             st.markdown(message["content"])
 
     # ユーザーからの質問入力
-    user_query = st.chat_input("例：学生寮に入っている場合の申請書類を教えてください")
-    if user_query:
+user_query = st.chat_input("例：学生寮に入っている場合の申請書類を教えてください")
+if user_query:
         with st.chat_message("user"):
             st.markdown(user_query)
         st.session_state.messages.append({"role": "user", "content": user_query})
