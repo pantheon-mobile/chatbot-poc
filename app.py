@@ -70,17 +70,17 @@ with tab1:
             try:
                 aws_filter = None
                 if target_user == "学生":
-                    aws_filter = {"or": [
+                    aws_filter = {"orAll": [
                         {"equals": {"key": "user_type", "value": "学生"}},
                         {"equals": {"key": "user_type", "value": "all"}}
                     ]}
                 elif target_user == "教員":
-                    aws_filter = {"or": [
+                    aws_filter = {"orAll": [
                         {"equals": {"key": "user_type", "value": "教員"}},
                         {"equals": {"key": "user_type", "value": "all"}}
                     ]}
                 elif target_user == "職員":
-                    aws_filter = {"or": [
+                    aws_filter = {"orAll": [
                         {"equals": {"key": "user_type", "value": "職員"}},
                         {"equals": {"key": "user_type", "value": "all"}}
                     ]}
