@@ -91,12 +91,29 @@ with tab1:
                     'modelArn': 'jp.anthropic.claude-sonnet-4-6'
                 }
 
-                if aws_filter:
-                    kb_config['retrievalConfiguration'] = {
-                        'vectorSearchConfiguration': {
-                            'filter': aws_filter
-                        }
+                kb_config['retrievalConfiguration'] = {
+                    'vectorSearchConfiguration': {
+                        'numberOfResults': 5
                     }
+                }
+
+                if aws_filter:
+                    kb_config['retrievalConfiguration']['vectorSearchConfiguration']['filter'] = aws_filter
+
+
+                kb_config['generationConfiguration'] = {
+                    'promptTemplate': {
+                        'textPromptTemplate': (
+                            "あなたは大学の奨学金業務のベテラン職員です。提供された検索結果（マニュアルや規程の資料）のみに基づいて、ユーザーの質問に正確に答えてください。\n\n"
+                            "【厳格な指示】\n"
+                            "1. 資料内に「表」や「一覧リスト」がある場合は、その中に書かれている具体的な書類名（例：確認書兼個人信用情報の取扱いに関する同意書）、対象者、条件、注意点を、絶対に「確認書」などと一言に要約したり省略したりしてはいけません。\n"
+                            "2. 資料に記載されている具体的な書類名や対象者の条件を、1文字の漏れもなく、すべて詳細な箇条書き（リスト形式）で徹底的に出力してください。\n"
+                            "3. 資料に書かれていない嘘（ハルシネーション）は一切混ぜないでください。\n\n"
+                            "検索結果:\n$search_results$\n\n"
+                            "ユーザーの質問: $query$"
+                        )
+                    }
+                }
 
                 # Amazon Bedrock ナレッジベースを呼び出し
                 response = bedrock_agent_runtime.retrieve_and_generate(
