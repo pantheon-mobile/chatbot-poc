@@ -45,6 +45,7 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("キャンセル", key=f"dlg_can_{message_index}", use_container_width=True):
+            st.session_state[f"feedback_done_{message_index}"] = True
             st.rerun()
             
     with col2:
@@ -71,8 +72,9 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
                         'user_type': user_type
                     }
                 )
-                st.toast("フィードバックを送信しました！")
-                st.session_state[f"fb_live_{message_index}"] = None
+                st.session_state[f"feedback_done_{message_index}"] = True
+                st.toast("フィードバックを送信しました。")
+                st.rerun()
             except Exception as e:
                 st.error(f"データベース保存エラー: {e}")
 
@@ -164,16 +166,14 @@ with tab1:
             feedback = st.feedback("thumbs", key=f"fb_{idx}")
             
             # ボタンが押されたら、上記で定義したポップアップ関数をフワッと起動
-            if feedback is not None:
-                # 1つ前のユーザーの質問（query）を取得
+            if feedback is not None and not st.session_state.get(f"feedback_done_{idx}", False):
                 user_query_text = st.session_state.messages[idx-1]["content"] if idx > 0 else "不明な質問"
-                
-                # ポップアップを画面中央に起動させる
+
                 show_feedback_dialog(
-                    score=feedback, 
-                    message_index=idx, 
-                    query=user_query_text, 
-                    response_text=message["content"], 
+                    score=feedback,
+                    message_index=idx,
+                    query=user_query_text,
+                    response_text=message["content"],
                     user_type=target_user
                 )
 
