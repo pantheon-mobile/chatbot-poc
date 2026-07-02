@@ -176,10 +176,10 @@ with tab1:
     st.caption("AWS S3に格納したQ&Aドキュメントベースでお答えします。")
 
     if st.button("チャットを初期化"):
-    st.session_state.messages = []
-    st.session_state.feedback_target = None
-    st.session_state.feedback_key_version = {}
-    st.rerun()
+        st.session_state.messages = []
+        st.session_state.feedback_target = None
+        st.session_state.feedback_key_version = {}
+        st.rerun()
 
     target_user = st.radio(
         "対象者を選択してください：",
