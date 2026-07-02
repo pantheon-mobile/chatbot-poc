@@ -7,7 +7,7 @@ import zipfile
 import traceback
 from datetime import datetime
 
-print(boto3.__version__)
+st.sidebar.write(f"boto3: {boto3.__version__}")
 
 
 # ==========================================
