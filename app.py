@@ -5,6 +5,7 @@ import json
 import io
 import zipfile
 import traceback
+import re
 from datetime import datetime
 
 st.sidebar.write(f"boto3: {boto3.__version__}")
@@ -91,6 +92,125 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
                 st.error(f"データベース保存エラー: {e}")
 
 
+
+
+# ==========================================
+#  PDFメタデータ生成 共通関数
+# ==========================================
+def sanitize_document_name(file_name: str) -> str:
+    """Bedrock Converse APIのdocument.name用に安全な名前へ変換する。"""
+    base_name = file_name.rsplit(".", 1)[0]
+    safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", base_name)
+    safe_name = safe_name.strip("_")
+    return safe_name[:120] if safe_name else "document"
+
+
+def extract_json_from_text(text: str) -> dict:
+    """Claudeの応答からJSON部分だけを取り出してdict化する。"""
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("JSON形式の応答を取得できませんでした。")
+
+    return json.loads(cleaned[start:end + 1])
+
+
+def generate_pdf_metadata_with_claude(pdf_bytes: bytes, file_name: str, model_id: str) -> tuple[dict, str]:
+    """PDFをClaude Sonnetへ渡し、Bedrock Knowledge Base用metadata.jsonを生成する。"""
+    bedrock_runtime = boto3.client(
+        service_name="bedrock-runtime",
+        region_name="ap-northeast-1",
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+    )
+
+    prompt = """
+あなたはAmazon Bedrock Knowledge BasesのRAG設計者です。
+添付PDFを読み取り、S3に配置する .metadata.json を作成してください。
+
+目的:
+- Knowledge Base検索時に文書を適切に絞り込み、検索精度を上げること
+- 奨学金業務・大学業務の質問に対して、対象文書が見つかりやすくなること
+
+必ず以下のJSONのみを返してください。説明文やMarkdownコードブロックは不要です。
+
+{
+  "metadataAttributes": {
+    "document_type": "",
+    "category": "",
+    "business": "",
+    "system": "",
+    "school_type": "",
+    "target_user": "",
+    "keywords": [],
+    "summary": ""
+  }
+}
+
+各項目のルール:
+- document_type: 操作マニュアル / 規程 / FAQ / データ仕様書 / 申請書 / 通知 / その他 のいずれかを基本にする
+- category: 返還免除、奨学金申込、推薦、採用、継続、授業料後払い制度など、業務カテゴリを短く書く
+- business: 文書が扱う具体的な業務名を書く
+- system: スカラAC、スカラネット、JASSO等、該当するシステムや機関名。不明なら空文字
+- school_type: 大学 / 大学院 / 高校 / 全学種 / 不明 のいずれかに近い値
+- target_user: 学生 / 教員 / 職員 / all のいずれか。学校担当者向けマニュアルは職員
+- keywords: 検索で使われそうな日本語キーワードを10〜20個。略称、正式名称、画面名、制度名を含める
+- summary: 100文字程度で、このPDFの内容を要約する
+
+注意:
+- PDFに書かれていない内容を推測しすぎない
+- keywordsには質問に使われそうな語を優先する
+- JSONとしてパース可能な形式にする
+"""
+
+    response = bedrock_runtime.converse(
+        modelId=model_id,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "document": {
+                            "format": "pdf",
+                            "name": sanitize_document_name(file_name),
+                            "source": {
+                                "bytes": pdf_bytes
+                            }
+                        }
+                    },
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        inferenceConfig={
+            "maxTokens": 1500,
+            "temperature": 0,
+            "topP": 0.1
+        }
+    )
+
+    response_text = response["output"]["message"]["content"][0]["text"]
+    metadata = extract_json_from_text(response_text)
+
+    # Knowledge Base用の最低限の形を保証
+    if "metadataAttributes" not in metadata:
+        metadata = {"metadataAttributes": metadata}
+
+    attrs = metadata["metadataAttributes"]
+    attrs["source_file_name"] = file_name
+    attrs["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return metadata, response_text
+
 # ==========================================
 #  初期設定
 # ==========================================
@@ -139,7 +259,8 @@ page = st.sidebar.radio(
     [
         "💬 チャット検証画面",
         "📊 Excel自動変換ツール",
-        "💾 フィードバックCSV出力"
+        "💾 フィードバックCSV出力",
+        "🧾 PDFメタデータ生成"
     ]
 )
 
@@ -516,3 +637,135 @@ elif page == "💾 フィードバックCSV出力":
 
         except Exception as e:
             st.error(f"CSV出力中にエラーが発生しました: {e}")
+
+# ==========================================
+#  メニュー4：PDFメタデータ生成ツール
+# ==========================================
+elif page == "🧾 PDFメタデータ生成":
+    st.title("🧾 PDF ➡ Bedrock Knowledge Base メタデータ生成")
+    st.write(
+        "PDFを複数アップロードすると、Claude Sonnetで内容を解析し、"
+        "Bedrock Knowledge Base用の `.metadata.json` を一括生成します。"
+    )
+
+    st.info(
+        "115件のような大量PDFにも対応できるよう、複数ファイルを順番に処理し、"
+        "最後にZIPで一括ダウンロードします。処理時間やBedrockのレート制限を考慮し、"
+        "まずは10〜20件程度で試験することを推奨します。"
+    )
+
+    model_id = st.text_input(
+        "生成モデルID",
+        value="jp.anthropic.claude-sonnet-4-6"
+    )
+
+    uploaded_pdfs = st.file_uploader(
+        "PDFファイルをアップロードしてください（複数選択可）",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_pdfs:
+        st.write(f"アップロード数: {len(uploaded_pdfs)} 件")
+
+        preview_df = pd.DataFrame([
+            {
+                "ファイル名": f.name,
+                "サイズ(KB)": round(len(f.getvalue()) / 1024, 1)
+            }
+            for f in uploaded_pdfs
+        ])
+        st.dataframe(preview_df, use_container_width=True)
+
+        if st.button("🚀 メタデータを一括生成", type="primary"):
+            zip_buffer = io.BytesIO()
+            results = []
+            progress_bar = st.progress(0)
+            status_area = st.empty()
+            detail_area = st.container()
+
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                total = len(uploaded_pdfs)
+
+                for idx, uploaded_pdf in enumerate(uploaded_pdfs, start=1):
+                    file_name = uploaded_pdf.name
+                    status_area.info(f"{idx}/{total} 処理中: {file_name}")
+
+                    try:
+                        pdf_bytes = uploaded_pdf.getvalue()
+
+                        metadata, raw_response = generate_pdf_metadata_with_claude(
+                            pdf_bytes=pdf_bytes,
+                            file_name=file_name,
+                            model_id=model_id
+                        )
+
+                        metadata_json = json.dumps(metadata, ensure_ascii=False, indent=2)
+                        metadata_filename = f"{file_name}.metadata.json"
+
+                        zip_file.writestr(metadata_filename, metadata_json)
+
+                        attrs = metadata.get("metadataAttributes", {})
+                        results.append({
+                            "ファイル名": file_name,
+                            "結果": "成功",
+                            "document_type": attrs.get("document_type", ""),
+                            "category": attrs.get("category", ""),
+                            "business": attrs.get("business", ""),
+                            "target_user": attrs.get("target_user", ""),
+                            "summary": attrs.get("summary", "")
+                        })
+
+                        with detail_area.expander(f"✅ {file_name}"):
+                            st.code(metadata_json, language="json")
+
+                    except Exception as e:
+                        error_metadata = {
+                            "metadataAttributes": {
+                                "document_type": "エラー",
+                                "category": "未分類",
+                                "business": "",
+                                "system": "",
+                                "school_type": "不明",
+                                "target_user": "all",
+                                "keywords": [],
+                                "summary": "メタデータ生成時にエラーが発生しました。",
+                                "source_file_name": file_name,
+                                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "error_message": str(e)
+                            }
+                        }
+
+                        error_json = json.dumps(error_metadata, ensure_ascii=False, indent=2)
+                        zip_file.writestr(f"{file_name}.metadata.json", error_json)
+
+                        results.append({
+                            "ファイル名": file_name,
+                            "結果": "エラー",
+                            "document_type": "",
+                            "category": "",
+                            "business": "",
+                            "target_user": "",
+                            "summary": str(e)
+                        })
+
+                        with detail_area.expander(f"❌ {file_name}"):
+                            st.error(str(e))
+                            st.code(traceback.format_exc())
+
+                    progress_bar.progress(idx / total)
+
+            status_area.success("メタデータ生成が完了しました。")
+
+            result_df = pd.DataFrame(results)
+            st.subheader("処理結果")
+            st.dataframe(result_df, use_container_width=True)
+
+            zip_file_name = datetime.now().strftime("pdf_metadata_%Y%m%d%H%M%S.zip")
+
+            st.download_button(
+                label="💾 metadata.json一式をZIPでダウンロード",
+                data=zip_buffer.getvalue(),
+                file_name=zip_file_name,
+                mime="application/zip"
+            )
