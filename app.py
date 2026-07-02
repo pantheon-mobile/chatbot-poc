@@ -7,6 +7,7 @@ import zipfile
 import traceback
 import re
 from datetime import datetime
+from pypdf import PdfReader
 
 st.sidebar.write(f"boto3: {boto3.__version__}")
 
@@ -97,12 +98,16 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
 # ==========================================
 #  PDFメタデータ生成 共通関数
 # ==========================================
-def sanitize_document_name(file_name: str) -> str:
-    """Bedrock Converse APIのdocument.name用に安全な名前へ変換する。"""
-    base_name = file_name.rsplit(".", 1)[0]
-    safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", base_name)
-    safe_name = safe_name.strip("_")
-    return safe_name[:120] if safe_name else "document"
+def extract_pdf_head_text(pdf_bytes: bytes, max_pages: int = 5) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    texts = []
+
+    for i, page in enumerate(reader.pages[:max_pages]):
+        text = page.extract_text()
+        if text:
+            texts.append(f"\n--- page {i + 1} ---\n{text}")
+
+    return "\n".join(texts).strip()
 
 
 def extract_json_from_text(text: str) -> dict:
@@ -122,8 +127,7 @@ def extract_json_from_text(text: str) -> dict:
     return json.loads(cleaned[start:end + 1])
 
 
-def generate_pdf_metadata_with_claude(pdf_bytes: bytes, file_name: str, model_id: str) -> tuple[dict, str]:
-    """PDFをClaude Sonnetへ渡し、Bedrock Knowledge Base用metadata.jsonを生成する。"""
+def generate_pdf_metadata_with_claude(pdf_text: str, file_name: str, model_id: str) -> tuple[dict, str]:
     bedrock_runtime = boto3.client(
         service_name="bedrock-runtime",
         region_name="ap-northeast-1",
@@ -131,18 +135,20 @@ def generate_pdf_metadata_with_claude(pdf_bytes: bytes, file_name: str, model_id
         aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
     )
 
-    prompt = """
+    prompt = f"""
 あなたはAmazon Bedrock Knowledge BasesのRAG設計者です。
-添付PDFを読み取り、S3に配置する .metadata.json を作成してください。
+以下のPDF先頭テキストをもとに、S3に配置する .metadata.json を作成してください。
 
-目的:
-- Knowledge Base検索時に文書を適切に絞り込み、検索精度を上げること
-- 奨学金業務・大学業務の質問に対して、対象文書が見つかりやすくなること
+ファイル名:
+{file_name}
 
-必ず以下のJSONのみを返してください。説明文やMarkdownコードブロックは不要です。
+PDF先頭テキスト:
+{pdf_text}
 
-{
-  "metadataAttributes": {
+必ず以下のJSONのみを返してください。
+
+{{
+  "metadataAttributes": {{
     "document_type": "",
     "category": "",
     "business": "",
@@ -151,23 +157,15 @@ def generate_pdf_metadata_with_claude(pdf_bytes: bytes, file_name: str, model_id
     "target_user": "",
     "keywords": [],
     "summary": ""
-  }
-}
+  }}
+}}
 
-各項目のルール:
-- document_type: 操作マニュアル / 規程 / FAQ / データ仕様書 / 申請書 / 通知 / その他 のいずれかを基本にする
-- category: 返還免除、奨学金申込、推薦、採用、継続、授業料後払い制度など、業務カテゴリを短く書く
-- business: 文書が扱う具体的な業務名を書く
-- system: スカラAC、スカラネット、JASSO等、該当するシステムや機関名。不明なら空文字
-- school_type: 大学 / 大学院 / 高校 / 全学種 / 不明 のいずれかに近い値
-- target_user: 学生 / 教員 / 職員 / all のいずれか。学校担当者向けマニュアルは職員
-- keywords: 検索で使われそうな日本語キーワードを10〜20個。略称、正式名称、画面名、制度名を含める
-- summary: 100文字程度で、このPDFの内容を要約する
-
-注意:
-- PDFに書かれていない内容を推測しすぎない
-- keywordsには質問に使われそうな語を優先する
-- JSONとしてパース可能な形式にする
+ルール:
+- document_type: 操作マニュアル / 規程 / FAQ / データ仕様書 / 申請書 / 通知 / その他
+- target_user: 学生 / 教員 / 職員 / all
+- keywords: 検索で使われそうな語を10〜20個
+- summary: 100文字程度
+- JSON以外は出力しない
 """
 
     response = bedrock_runtime.converse(
@@ -175,33 +173,18 @@ def generate_pdf_metadata_with_claude(pdf_bytes: bytes, file_name: str, model_id
         messages=[
             {
                 "role": "user",
-                "content": [
-                    {
-                        "document": {
-                            "format": "pdf",
-                            "name": sanitize_document_name(file_name),
-                            "source": {
-                                "bytes": pdf_bytes
-                            }
-                        }
-                    },
-                    {
-                        "text": prompt
-                    }
-                ]
+                "content": [{"text": prompt}]
             }
         ],
         inferenceConfig={
             "maxTokens": 1500,
-            "temperature": 0,
-            "topP": 0.1
+            "temperature": 0
         }
     )
 
     response_text = response["output"]["message"]["content"][0]["text"]
     metadata = extract_json_from_text(response_text)
 
-    # Knowledge Base用の最低限の形を保証
     if "metadataAttributes" not in metadata:
         metadata = {"metadataAttributes": metadata}
 
@@ -694,8 +677,13 @@ elif page == "🧾 PDFメタデータ生成":
                     try:
                         pdf_bytes = uploaded_pdf.getvalue()
 
+                        pdf_text = extract_pdf_head_text(pdf_bytes, max_pages=5)
+
+                        if not pdf_text:
+                            raise ValueError("PDFからテキストを抽出できませんでした。画像PDFの可能性があります。")
+                        
                         metadata, raw_response = generate_pdf_metadata_with_claude(
-                            pdf_bytes=pdf_bytes,
+                            pdf_text=pdf_text,
                             file_name=file_name,
                             model_id=model_id
                         )
