@@ -4,8 +4,8 @@ import pandas as pd
 import json
 import io
 import zipfile
-import traceback from datetime 
-import datetime
+import traceback
+from datetime import datetime
 import streamlit as st
 
 @st.dialog("フィードバックを送る")
