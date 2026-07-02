@@ -136,7 +136,8 @@ page = st.sidebar.radio(
     "メニュー",
     [
         "💬 チャット検証画面",
-        "📊 Excel自動変換ツール"
+        "📊 Excel自動変換ツール",
+        "💾 フィードバックCSV出力"
     ]
 )
 
@@ -171,7 +172,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-#  タブ1：チャット検証画面
+#  メニュー1：チャット検証画面
 # ==========================================
 if page == "💬 チャット検証画面":
     if "feedback_toast" in st.session_state:
@@ -359,7 +360,7 @@ if page == "💬 チャット検証画面":
 
 
 # ==========================================
-#  タブ2：管理者専用 Excel自動変換ツール
+#  メニュー2：管理者専用 Excel自動変換ツール
 # ==========================================
 elif page == "📊 Excel自動変換ツール":
     st.title("📊 Excel ➡ Bedrockデータ一括自動変換")
@@ -445,3 +446,70 @@ elif page == "📊 Excel自動変換ツール":
 
         except Exception as e:
             st.error(f"ファイル処理中にエラーが発生しました: {str(e)}")
+
+# ==========================================
+#  メニュー3：管理者専用 フィードバックCSV出力ツール
+# ==========================================
+elif page == "💾 フィードバックCSV出力":
+
+    st.title("💾 フィードバックCSV出力")
+    st.write("Good/Badボタンで保存されたフィードバックデータをCSVファイルとして出力します。")
+
+    if st.button("CSVファイルを作成"):
+        try:
+            dynamodb = boto3.resource(
+                service_name="dynamodb",
+                region_name="ap-northeast-1",
+                aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+                aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+            )
+
+            table = dynamodb.Table("chatbot-feedback-table")
+
+            items = []
+            response = table.scan()
+            items.extend(response.get("Items", []))
+
+            while "LastEvaluatedKey" in response:
+                response = table.scan(
+                    ExclusiveStartKey=response["LastEvaluatedKey"]
+                )
+                items.extend(response.get("Items", []))
+
+            if not items:
+                st.warning("出力対象のフィードバックデータがありません。")
+            else:
+                df = pd.DataFrame(items)
+
+                # 見やすい順番に並べ替え
+                columns = [
+                    "feedback_id",
+                    "timestamp",
+                    "user_type",
+                    "score",
+                    "problem_type",
+                    "comment",
+                    "query",
+                    "response"
+                ]
+
+                existing_columns = [col for col in columns if col in df.columns]
+                remaining_columns = [col for col in df.columns if col not in existing_columns]
+
+                df = df[existing_columns + remaining_columns]
+
+                csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+
+                file_name = datetime.now().strftime("%Y%m%d%H%M%S.csv")
+
+                st.success("CSVファイルを作成しました。")
+
+                st.download_button(
+                    label="CSVファイルをダウンロード",
+                    data=csv_data,
+                    file_name=file_name,
+                    mime="text/csv"
+                )
+
+        except Exception as e:
+            st.error(f"CSV出力中にエラーが発生しました: {e}")
