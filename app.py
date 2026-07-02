@@ -7,6 +7,8 @@ import zipfile
 import traceback
 from datetime import datetime
 
+print(boto3.__version__)
+
 
 # ==========================================
 #  ダイアログ：フィードバック送信
@@ -305,7 +307,8 @@ if page == "💬 チャット検証画面":
                     "modelArn": "jp.anthropic.claude-sonnet-4-6",
                     "retrievalConfiguration": {
                         "vectorSearchConfiguration": {
-                            "numberOfResults": 5
+                            "numberOfResults": 5,
+                            "overrideSearchType": "HYBRID"
                         }
                     },
                     "generationConfiguration": {
