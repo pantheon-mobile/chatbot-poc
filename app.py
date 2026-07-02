@@ -51,7 +51,12 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
         if st.button("送信", type="primary", key=f"dlg_sub_{message_index}", use_container_width=True):
             try:
                 # 🗄️ AWS DynamoDBへ「質問・回答・評価・コメント・属性」を一括自動格納
-                dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-1')
+                dynamodb = boto3.resource(
+                    service_name='dynamodb',
+                    region_name='ap-northeast-1',
+                    aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+                    aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+                )
                 table = dynamodb.Table('chatbot-feedback-table')
                 
                 table.put_item(
