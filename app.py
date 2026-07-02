@@ -73,7 +73,7 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
                     }
                 )
                 st.session_state[f"feedback_done_{message_index}"] = True
-                st.toast("フィードバックを送信しました。")
+                st.session_state["feedback_toast"] = "フィードバックを送信しました。"
                 st.rerun()
             except Exception as e:
                 st.error(f"データベース保存エラー: {e}")
@@ -104,6 +104,10 @@ tab1, tab2 = st.tabs(["💬 チャット検証画面", "📊 【管理者専用�
 #  タブ1：チャット検証画面（お客様・テスター用）
 # ==========================================
 with tab1:
+    if "feedback_toast" in st.session_state:
+        st.toast(st.session_state["feedback_toast"])
+        del st.session_state["feedback_toast"]
+        
     st.markdown(
         """
         <style>
