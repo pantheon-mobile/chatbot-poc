@@ -73,7 +73,6 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
                 )
                 st.toast("フィードバックを送信しました！")
                 st.session_state[f"fb_live_{message_index}"] = None
-                st.rerun()
             except Exception as e:
                 st.error(f"データベース保存エラー: {e}")
 
