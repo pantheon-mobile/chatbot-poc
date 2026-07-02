@@ -100,6 +100,35 @@ st.set_page_config(
     layout="wide"
 )
 
+st.markdown("""
+<style>
+
+/* サイドバー全体 */
+section[data-testid="stSidebar"] {
+    background-color: #F8F9FA;
+}
+
+/* メニュータイトル */
+section[data-testid="stSidebar"] label {
+    font-size: 18px !important;
+    font-weight: 700 !important;
+}
+
+/* ラジオボタンの文字 */
+section[data-testid="stSidebar"] div[role="radiogroup"] label p {
+    font-size: 18px !important;
+    font-weight: 500 !important;
+}
+
+/* ラジオボタンの余白 */
+section[data-testid="stSidebar"] div[role="radiogroup"] label {
+    padding-top: 8px;
+    padding-bottom: 8px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
 # ==========================================
 #  サイドメニュー
 # ==========================================
