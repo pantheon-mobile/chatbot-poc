@@ -248,7 +248,7 @@ if user_query:
                 response_placeholder.markdown(ai_answer)
                 st.session_state.messages.append({"role": "assistant", "content": ai_answer})
 
-            live_idx = len(st.session_state.messages) - 1
+                live_idx = len(st.session_state.messages) - 1
                 live_feedback = st.feedback("thumbs", key=f"fb_live_{live_idx}")
                 if live_feedback is not None:
                     show_feedback_dialog(live_feedback, live_idx, user_query, ai_answer, target_user)
