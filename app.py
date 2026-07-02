@@ -100,6 +100,17 @@ st.set_page_config(
     layout="wide"
 )
 
+# ==========================================
+#  サイドメニュー
+# ==========================================
+page = st.sidebar.radio(
+    "メニュー",
+    [
+        "💬 チャット検証画面",
+        "📊 Excel自動変換ツール"
+    ]
+)
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -130,17 +141,10 @@ if not st.session_state.authenticated:
 
     st.stop()
 
-
-# ==========================================
-#  タブ
-# ==========================================
-tab1, tab2 = st.tabs(["💬 チャット検証画面", "📊 【管理者専用】Excel自動変換ツール"])
-
-
 # ==========================================
 #  タブ1：チャット検証画面
 # ==========================================
-with tab1:
+if page == "💬 チャット検証画面":
     if "feedback_toast" in st.session_state:
         st.toast(st.session_state.feedback_toast)
         del st.session_state.feedback_toast
@@ -227,10 +231,9 @@ with tab1:
             response_text=fb["response_text"],
             user_type=fb["user_type"]
         )
-
     # 入力
-user_query = st.chat_input("例：学生寮に入っている場合の申請書類を教えてください")
-
+    user_query = st.chat_input("例：学生寮に入っている場合の申請書類を教えてください")
+    
     if user_query:
         st.session_state.messages.append({"role": "user", "content": user_query})
 
@@ -329,7 +332,7 @@ user_query = st.chat_input("例：学生寮に入っている場合の申請書�
 # ==========================================
 #  タブ2：管理者専用 Excel自動変換ツール
 # ==========================================
-with tab2:
+elif page == "📊 Excel自動変換ツール":
     st.title("📊 Excel ➡ Bedrockデータ一括自動変換")
     st.write(
         "Q&A管理用のExcelファイルをアップロードすると、"
