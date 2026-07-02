@@ -200,8 +200,6 @@ with tab1:
                     "user_type": target_user
                 }
 
-                st.rerun()
-
     # ダイアログ表示はループ外で1回だけ
     if st.session_state.feedback_target is not None:
         fb = st.session_state.feedback_target
