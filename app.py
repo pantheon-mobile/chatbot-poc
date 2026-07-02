@@ -46,6 +46,9 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
 
     with col1:
         if st.button("キャンセル", key=f"dlg_can_{message_index}", use_container_width=True):
+            st.session_state.feedback_key_version[message_index] = (
+                st.session_state.feedback_key_version.get(message_index, 0) + 1
+            )
             st.session_state.feedback_target = None
             st.rerun()
 
@@ -74,7 +77,10 @@ def show_feedback_dialog(score, message_index, query, response_text, user_type):
                     }
                 )
 
-                st.session_state[f"feedback_done_{message_index}"] = True
+                st.session_state.feedback_key_version[message_index] = (
+                    st.session_state.feedback_key_version.get(message_index, 0) + 1
+                )
+
                 st.session_state.feedback_target = None
                 st.session_state.feedback_toast = "フィードバックを送信しました。"
                 st.rerun()
@@ -102,6 +108,9 @@ if "messages" not in st.session_state:
 
 if "feedback_target" not in st.session_state:
     st.session_state.feedback_target = None
+
+if "feedback_key_version" not in st.session_state:
+    st.session_state.feedback_key_version = {}
 
 
 # ==========================================
@@ -187,9 +196,10 @@ with tab1:
             st.markdown(message["content"])
 
         if message["role"] == "assistant":
-            feedback = st.feedback("thumbs", key=f"fb_{idx}")
+            version = st.session_state.feedback_key_version.get(idx, 0)
+            feedback = st.feedback("thumbs", key=f"fb_{idx}_{version}")
 
-            if feedback is not None and not st.session_state.get(f"feedback_done_{idx}", False):
+            if feedback is not None:
                 user_query_text = st.session_state.messages[idx - 1]["content"] if idx > 0 else "不明な質問"
 
                 st.session_state.feedback_target = {
