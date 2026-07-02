@@ -4,7 +4,72 @@ import pandas as pd
 import json
 import io
 import zipfile
-import traceback 
+import traceback from datetime 
+import datetime
+import streamlit as st
+
+@st.dialog("フィードバックを送る")
+def show_feedback_dialog(score, message_index, query, response_text, user_type):
+    # バッド（改善）ボタンが押された場合（score == 0）
+    if score == 0:
+        st.markdown("### 改善フィードバックを送る")
+        
+        # 📄 画像2枚目のセレクトボックスを完全再現
+        problem_type = st.selectbox(
+            "報告したい問題の種類を選択してください（任意）",
+            ["選択してください", "要求を完全に満たしていない", "回答に誤りがある", "情報が古い", "その他"]
+        )
+        
+        st.write("詳細を入力してください（任意）：")
+        user_comment = st.text_area(
+            "詳細", 
+            placeholder="この回答のどこに不満がありましたか？", 
+            label_visibility="collapsed",
+            key=f"dlg_cmt_{message_index}"
+        )
+        
+    # グッド（ポジティブ）ボタンが押された場合（score == 1）
+    else:
+        st.markdown("### ポジティブなフィードバックを送る")
+        problem_type = "ポジティブ（良好）"
+        
+        st.write("詳細を入力してください（任意）：")
+        user_comment = st.text_area(
+            "詳細", 
+            placeholder="この回答の満足できた点は何ですか？", 
+            label_visibility="collapsed",
+            key=f"dlg_cmt_{message_index}"
+        )
+
+    # ボタンを横並びに配置（キャンセル / 送信）
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("キャンセル", key=f"dlg_can_{message_index}", use_container_width=True):
+            st.rerun()
+            
+    with col2:
+        if st.button("送信", type="primary", key=f"dlg_sub_{message_index}", use_container_width=True):
+            try:
+                # 🗄️ AWS DynamoDBへ「質問・回答・評価・コメント・属性」を一括自動格納
+                dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-1')
+                table = dynamodb.Table('chatbot-feedback-table')
+                
+                table.put_item(
+                    Item={
+                        'feedback_id': f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{message_index}", # 一意のキー
+                        'timestamp': str(datetime.now()),
+                        'query': query,
+                        'response': response_text,
+                        'score': int(score), # 1=Good, 0=Bad
+                        'problem_type': problem_type,
+                        'comment': user_comment if user_comment else "なし",
+                        'user_type': user_type
+                    }
+                )
+                st.toast("フィードバックを送信しました！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"データベース保存エラー: {e}")
 
 # --- 🔒 セキュリティ設定（パスワード） ---
 VALID_PASSWORD = "hp_chatbot_2026"
@@ -85,9 +150,27 @@ with tab1:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    for message in st.session_state.messages:
+    for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            
+        if message["role"] == "assistant":
+            # 画面上にGood/Badボタンを設置
+            feedback = st.feedback("thumbs", key=f"fb_{idx}")
+            
+            # ボタンが押されたら、上記で定義したポップアップ関数をフワッと起動
+            if feedback is not None:
+                # 1つ前のユーザーの質問（query）を取得
+                user_query_text = st.session_state.messages[idx-1]["content"] if idx > 0 else "不明な質問"
+                
+                # ポップアップを画面中央に起動させる
+                show_feedback_dialog(
+                    score=feedback, 
+                    message_index=idx, 
+                    query=user_query_text, 
+                    response_text=message["content"], 
+                    user_type=target_user
+                )
 
     # ユーザーからの質問入力
 user_query = st.chat_input("例：学生寮に入っている場合の申請書類を教えてください")
