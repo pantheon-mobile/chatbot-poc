@@ -193,8 +193,7 @@ def generate_pdf_metadata_with_claude(pdf_bytes: bytes, file_name: str, model_id
         ],
         inferenceConfig={
             "maxTokens": 1500,
-            "temperature": 0,
-            "topP": 0.1
+            "temperature": 0
         }
     )
 
