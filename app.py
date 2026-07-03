@@ -335,12 +335,12 @@ if page == "💬 チャット検証画面":
     st.sidebar.subheader("⚙️ RAG設定")
     
     kb_options = {
-        "現行KB（No Chunking）": "TZKVQ8D3M6",
-        "新KB（Hierarchical）": "BXMG6V1XFR"
+        "新KB（Hierarchical）": "BXMG6V1XFR",
+        "現行KB（No Chunking）": "TZKVQ8D3M6"
     }
     
     selected_kb_name = st.sidebar.selectbox(
-        "Knowledge Base",
+        "ナレッジベース",
         list(kb_options.keys())
     )
     
