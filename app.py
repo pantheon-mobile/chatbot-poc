@@ -334,7 +334,38 @@ if page == "💬 チャット検証画面":
         aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
     )
 
-    KNOWLEDGE_BASE_ID = "TZKVQ8D3M6"
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ RAG設定")
+    
+    kb_options = {
+        "現行KB（No Chunking）": "TZKVQ8D3M6",
+        "新KB（Hierarchical）": "BXMG6V1XFR"
+    }
+    
+    selected_kb_name = st.sidebar.selectbox(
+        "Knowledge Base",
+        list(kb_options.keys())
+    )
+    
+    KNOWLEDGE_BASE_ID = kb_options[selected_kb_name]
+    
+    search_type_label = st.sidebar.radio(
+        "Search Type",
+        ["HYBRID", "SEMANTIC"],
+        horizontal=True
+    )
+    
+    top_k = st.sidebar.selectbox(
+        "Top K（取得チャンク数）",
+        [3, 5, 8, 10],
+        index=1
+    )
+    
+    max_tokens = st.sidebar.selectbox(
+        "Maximum output tokens",
+        [1000, 2000, 4000],
+        index=2
+    )
 
     # 既存メッセージ表示
     for idx, message in enumerate(st.session_state.messages):
@@ -411,14 +442,14 @@ if page == "💬 チャット検証画面":
                     "modelArn": "jp.anthropic.claude-sonnet-4-6",
                     "retrievalConfiguration": {
                         "vectorSearchConfiguration": {
-                            "numberOfResults": 5,
-                            "overrideSearchType": "HYBRID"
+                            "numberOfResults": top_k,
+                            "overrideSearchType": search_type_label
                         }
                     },
                     "generationConfiguration": {
                         "inferenceConfig": {
                             "textInferenceConfig": {
-                                "maxTokens": 4000
+                                "maxTokens": max_tokens
                             }
                         },
                         "promptTemplate": {
