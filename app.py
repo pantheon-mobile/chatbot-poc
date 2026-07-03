@@ -347,7 +347,7 @@ if page == "💬 チャット検証画面":
     KNOWLEDGE_BASE_ID = kb_options[selected_kb_name]
     
     search_type_label = st.sidebar.radio(
-        "Search Type",
+        "検索タイプ",
         ["HYBRID", "SEMANTIC"],
         horizontal=True
     )
