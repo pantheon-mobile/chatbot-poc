@@ -261,7 +261,7 @@ if "feedback_key_version" not in st.session_state:
 #  パスワード認証
 # ==========================================
 if not st.session_state.authenticated:
-    st.title("🔒 パスワード認証")
+    st.header("🔒 パスワード認証")
 
     user_password = st.text_input("検証用パスワードを入力してください", type="password")
 
@@ -309,7 +309,7 @@ if page == "💬 チャット検証画面":
         unsafe_allow_html=True
     )
 
-    st.title("チャットボット検証")
+    st.header("チャットボット検証")
     st.caption("AWS S3に格納したQ&Aドキュメントベースでお答えします。")
 
     if st.button("チャットを初期化"):
