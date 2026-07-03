@@ -9,9 +9,6 @@ import re
 from datetime import datetime
 from pypdf import PdfReader
 
-st.sidebar.write(f"boto3: {boto3.__version__}")
-
-
 # ==========================================
 #  ダイアログ：フィードバック送信
 # ==========================================
