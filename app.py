@@ -335,8 +335,8 @@ if page == "💬 チャット検証画面":
     st.sidebar.subheader("⚙️ RAG設定")
     
     kb_options = {
-        "新KB（Hierarchical）": "BXMG6V1XFR",
-        "現行KB（No Chunking）": "TZKVQ8D3M6"
+        "階層型": "BXMG6V1XFR",
+        "チャンクなし": "UFH1XNWUJE"
     }
     
     selected_kb_name = st.sidebar.selectbox(
