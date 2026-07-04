@@ -194,7 +194,7 @@ PDF先頭テキスト:
 # ==========================================
 #  初期設定
 # ==========================================
-VALID_PASSWORD = "hp_chatbot_2026"
+APP_PASSWORD = st.secrets["app"]["password"]
 
 st.set_page_config(
     page_title="ハーモニープラス チャットボットPoC",
@@ -266,7 +266,7 @@ if not st.session_state.authenticated:
     user_password = st.text_input("検証用パスワードを入力してください", type="password")
 
     if st.button("ログイン"):
-        if user_password == VALID_PASSWORD:
+        if user_password == APP_PASSWORD:
             st.session_state.authenticated = True
             st.rerun()
         else:
