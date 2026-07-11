@@ -7,6 +7,7 @@ import zipfile
 import traceback
 import re
 from datetime import datetime
+from typing import Optional
 from pypdf import PdfReader
 
 # ==========================================
@@ -190,6 +191,219 @@ PDF先頭テキスト:
     attrs["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return metadata, response_text
+
+
+# ==========================================
+#  チャット検証画面 共通関数
+# ==========================================
+CHAT_MODEL_ID = "jp.anthropic.claude-sonnet-4-6"
+
+
+def _normalize_message_text(text: str) -> str:
+    return re.sub(r"\s+", "", text.strip().lower())
+
+
+def _rule_classify_user_message(user_query: str) -> Optional[str]:
+    """明確な表現だけをルールで分類し、曖昧な場合はNoneを返す。"""
+    normalized = _normalize_message_text(user_query)
+
+    if not normalized:
+        return "CONVERSATION"
+
+    # 「前年度」「前期」などの制度・時期を聞く質問は、会話上の「前の回答」と区別してRAGへ送る。
+    rag_domain_patterns = [
+        r"奨学金",
+        r"申請",
+        r"提出書類",
+        r"必要書類",
+        r"期限",
+        r"締切",
+        r"制度",
+        r"規程",
+        r"規則",
+        r"対象者",
+        r"条件",
+        r"手続",
+        r"前年度",
+        r"今年度",
+        r"来年度",
+        r"前期",
+        r"後期",
+    ]
+
+    conversation_reference_patterns = [
+        r"さっきの回答",
+        r"先ほどの回答",
+        r"前の回答",
+        r"以前の回答",
+        r"最初の回答",
+        r"最後の回答",
+        r"直前の回答",
+        r"今の回答",
+        r"回答が違う",
+        r"回答に差がある",
+        r"前と何が違う",
+        r"同じことを聞いた",
+    ]
+    conversation_feedback_patterns = [
+        r"ありがとう",
+        r"ありがとうございます",
+        r"わかりました",
+        r"分かりました",
+        r"了解",
+        r"違う",
+        r"そうじゃない",
+        r"分かりにくい",
+        r"わかりにくい",
+        r"なぜ最初から書かなかった",
+        r"最初から具体的に",
+        r"最初から書いて",
+        r"具体的に書いて",
+    ]
+    conversation_rewrite_patterns = [
+        r"もっと詳しく",
+        r"もっと簡単に",
+        r"短くして",
+        r"短めに",
+        r"要約して",
+        r"言い換えて",
+        r"まとめて",
+    ]
+
+    if any(re.search(pattern, normalized) for pattern in conversation_reference_patterns):
+        return "CONVERSATION"
+
+    if any(re.search(pattern, normalized) for pattern in conversation_feedback_patterns):
+        has_domain_context = any(re.search(pattern, normalized) for pattern in rag_domain_patterns)
+        is_question = any(mark in user_query for mark in ["?", "？"]) or re.search(
+            r"(ですか|ますか|いつ|何|どこ|誰|どれ|必要|教えて)$",
+            normalized
+        )
+        if not (has_domain_context and is_question):
+            return "CONVERSATION"
+
+    if any(re.search(pattern, normalized) for pattern in conversation_rewrite_patterns):
+        has_domain_context = any(re.search(pattern, normalized) for pattern in rag_domain_patterns)
+        if has_domain_context:
+            return None
+        if len(normalized) <= 30:
+            return "CONVERSATION"
+
+    if any(re.search(pattern, normalized) for pattern in rag_domain_patterns):
+        return "RAG"
+
+    return None
+
+
+def classify_user_message(user_query: str, messages: list[dict]) -> str:
+    """ユーザー発言をRAGまたはCONVERSATIONに分類する。失敗時は安全側でRAGにする。"""
+    rule_result = _rule_classify_user_message(user_query)
+    if rule_result:
+        return rule_result
+
+    try:
+        bedrock_runtime = boto3.client(
+            service_name="bedrock-runtime",
+            region_name="ap-northeast-1",
+            aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+            aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+        )
+
+        recent_messages = messages[-8:]
+        history_text = "\n".join(
+            f"{message['role']}: {message['content']}"
+            for message in recent_messages
+        )
+
+        prompt = f"""
+あなたは大学向けチャットボットの入力分類器です。
+ユーザーの最新発言を、次のどちらか1語だけで分類してください。
+
+RAG:
+奨学金、申請、提出書類、期限、制度、規程など、ナレッジベースの情報を検索して回答すべき質問。
+
+CONVERSATION:
+過去の回答への感想、指摘、比較、訂正依頼、要約依頼、言い換え依頼、挨拶など、直前までの会話履歴だけで回答すべき発言。
+
+注意:
+- 「前年度の申請期限は？」のように制度・申請内容を聞く場合はRAG。
+- 「前の回答と違う」「さっきの回答を短くして」のように過去回答を扱う場合はCONVERSATION。
+- 必ず RAG または CONVERSATION のどちらか1語だけを返してください。
+
+会話履歴:
+{history_text}
+
+最新発言:
+{user_query}
+"""
+
+        response = bedrock_runtime.converse(
+            modelId=CHAT_MODEL_ID,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": prompt}]
+                }
+            ],
+            inferenceConfig={
+                "maxTokens": 10,
+                "temperature": 0
+            }
+        )
+        label = response["output"]["message"]["content"][0]["text"].strip().upper()
+        if label == "CONVERSATION":
+            return "CONVERSATION"
+        return "RAG"
+
+    except Exception:
+        return "RAG"
+
+
+def answer_conversation_with_claude(messages: list[dict], max_tokens: int) -> str:
+    bedrock_runtime = boto3.client(
+        service_name="bedrock-runtime",
+        region_name="ap-northeast-1",
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+    )
+
+    recent_messages = messages[-10:]
+    while recent_messages and recent_messages[0]["role"] != "user":
+        recent_messages = recent_messages[1:]
+
+    converse_messages = [
+        {
+            "role": message["role"],
+            "content": [{"text": message["content"]}]
+        }
+        for message in recent_messages
+        if message["role"] in ["user", "assistant"]
+    ]
+
+    system_prompt = """
+あなたは大学の奨学金チャットボットです。
+今回はナレッジベース検索ではなく、直前までの会話履歴だけを使って自然に回答してください。
+
+ルール:
+- ユーザーの発言が過去の回答への指摘や感想の場合は、まず内容を理解して自然に応答してください。
+- こちらの回答が不十分だった場合は、素直に謝罪してください。
+- 過去の回答同士の比較を求められた場合は、会話履歴を比較して違いを説明してください。
+- 「資料に記載がありません」のようなRAG向け回答はしないでください。
+- 会話履歴にない内容を捏造しないでください。
+- 必要に応じて簡潔に回答してください。
+"""
+
+    response = bedrock_runtime.converse(
+        modelId=CHAT_MODEL_ID,
+        system=[{"text": system_prompt}],
+        messages=converse_messages,
+        inferenceConfig={
+            "maxTokens": max_tokens,
+            "temperature": 0.2
+        }
+    )
+
+    return response["output"]["message"]["content"][0]["text"]
 
 # ==========================================
 #  初期設定
@@ -432,89 +646,97 @@ if page == "💬 チャット検証画面":
             response_placeholder = st.empty()
 
             try:
-                aws_filter = None
+                message_type = classify_user_message(user_query, st.session_state.messages)
 
-                if target_user == "学生":
-                    aws_filter = {
-                        "orAll": [
-                            {"equals": {"key": "user_type", "value": "学生"}},
-                            {"equals": {"key": "user_type", "value": "all"}}
-                        ]
-                    }
+                if message_type == "CONVERSATION":
+                    ai_answer = answer_conversation_with_claude(
+                        messages=st.session_state.messages,
+                        max_tokens=max_tokens
+                    )
+                else:
+                    aws_filter = None
 
-                elif target_user == "教員":
-                    aws_filter = {
-                        "orAll": [
-                            {"equals": {"key": "user_type", "value": "教員"}},
-                            {"equals": {"key": "user_type", "value": "all"}}
-                        ]
-                    }
-
-                elif target_user == "職員":
-                    aws_filter = {
-                        "orAll": [
-                            {"equals": {"key": "user_type", "value": "職員"}},
-                            {"equals": {"key": "user_type", "value": "all"}}
-                        ]
-                    }
-
-                kb_config = {
-                    "knowledgeBaseId": KNOWLEDGE_BASE_ID,
-                    "modelArn": "jp.anthropic.claude-sonnet-4-6",
-                    "retrievalConfiguration": {
-                        "vectorSearchConfiguration": {
-                            "numberOfResults": top_k,
-                            "overrideSearchType": search_type_label
+                    if target_user == "学生":
+                        aws_filter = {
+                            "orAll": [
+                                {"equals": {"key": "user_type", "value": "学生"}},
+                                {"equals": {"key": "user_type", "value": "all"}}
+                            ]
                         }
-                    },
-                    "generationConfiguration": {
-                        "inferenceConfig": {
-                            "textInferenceConfig": {
-                                "maxTokens": max_tokens
+
+                    elif target_user == "教員":
+                        aws_filter = {
+                            "orAll": [
+                                {"equals": {"key": "user_type", "value": "教員"}},
+                                {"equals": {"key": "user_type", "value": "all"}}
+                            ]
+                        }
+
+                    elif target_user == "職員":
+                        aws_filter = {
+                            "orAll": [
+                                {"equals": {"key": "user_type", "value": "職員"}},
+                                {"equals": {"key": "user_type", "value": "all"}}
+                            ]
+                        }
+
+                    kb_config = {
+                        "knowledgeBaseId": KNOWLEDGE_BASE_ID,
+                        "modelArn": CHAT_MODEL_ID,
+                        "retrievalConfiguration": {
+                            "vectorSearchConfiguration": {
+                                "numberOfResults": top_k,
+                                "overrideSearchType": search_type_label
                             }
                         },
-                        "promptTemplate": {
-                            "textPromptTemplate": (
-                                "あなたは大学の奨学金業務のベテラン職員です。"
-                                "提供された検索結果（マニュアルや規程の資料）を最優先の根拠として回答してください。"
-                                "資料に記載されていない内容は推測してはいけません。"
-                                "ただし、ユーザーが過去の会話内容や以前の回答との比較・確認を求めた場合は、"
-                                "現在の会話履歴も参照し、その内容を踏まえて回答してください。\n\n"
-                                "【重要な指示】\n"
-                                "1. 検索結果の資料内に、必要書類の名前や対象者の条件が断片的にでも記載されている場合は、"
-                                "見つかった書類名や条件をすべて漏れなく箇条書きで出力してください。\n"
-                                "2. 資料に記載されている具体的な書類名は省略せず、正式名称のまま出力してください。\n"
-                                "3. 資料に書かれていない内容は推測しないでください。\n"
-                                "4. ユーザーが『前の回答』『先ほどの回答』『最初の回答』『以前との違い』など、"
-                                "会話履歴に関する質問をした場合は、検索結果だけでなく会話履歴も参照して回答してください。\n\n"
-                                "検索結果:\n$search_results$\n\n"
-                                "ユーザーの質問: $query$"
-                            )
+                        "generationConfiguration": {
+                            "inferenceConfig": {
+                                "textInferenceConfig": {
+                                    "maxTokens": max_tokens
+                                }
+                            },
+                            "promptTemplate": {
+                                "textPromptTemplate": (
+                                    "あなたは大学の奨学金業務のベテラン職員です。"
+                                    "提供された検索結果（マニュアルや規程の資料）を最優先の根拠として回答してください。"
+                                    "資料に記載されていない内容は推測してはいけません。"
+                                    "ただし、ユーザーが過去の会話内容や以前の回答との比較・確認を求めた場合は、"
+                                    "現在の会話履歴も参照し、その内容を踏まえて回答してください。\n\n"
+                                    "【重要な指示】\n"
+                                    "1. 検索結果の資料内に、必要書類の名前や対象者の条件が断片的にでも記載されている場合は、"
+                                    "見つかった書類名や条件をすべて漏れなく箇条書きで出力してください。\n"
+                                    "2. 資料に記載されている具体的な書類名は省略せず、正式名称のまま出力してください。\n"
+                                    "3. 資料に書かれていない内容は推測しないでください。\n"
+                                    "4. ユーザーが『前の回答』『先ほどの回答』『最初の回答』『以前との違い』など、"
+                                    "会話履歴に関する質問をした場合は、検索結果だけでなく会話履歴も参照して回答してください。\n\n"
+                                    "検索結果:\n$search_results$\n\n"
+                                    "ユーザーの質問: $query$"
+                                )
+                            }
                         }
                     }
-                }
 
-                if aws_filter:
-                    kb_config["retrievalConfiguration"]["vectorSearchConfiguration"]["filter"] = aws_filter
+                    if aws_filter:
+                        kb_config["retrievalConfiguration"]["vectorSearchConfiguration"]["filter"] = aws_filter
 
-                retrieve_params = {
-                    "input": {"text": user_query},
-                    "retrieveAndGenerateConfiguration": {
-                        "type": "KNOWLEDGE_BASE",
-                        "knowledgeBaseConfiguration": kb_config
+                    retrieve_params = {
+                        "input": {"text": user_query},
+                        "retrieveAndGenerateConfiguration": {
+                            "type": "KNOWLEDGE_BASE",
+                            "knowledgeBaseConfiguration": kb_config
+                        }
                     }
-                }
-                if use_chat_history and st.session_state.rag_session_id:
-                    retrieve_params["sessionId"] = st.session_state.rag_session_id
+                    if use_chat_history and st.session_state.rag_session_id:
+                        retrieve_params["sessionId"] = st.session_state.rag_session_id
 
-                response = bedrock_agent_runtime.retrieve_and_generate(**retrieve_params)
+                    response = bedrock_agent_runtime.retrieve_and_generate(**retrieve_params)
 
-                if use_chat_history and "sessionId" in response:
-                    st.session_state.rag_session_id = response["sessionId"]
-                if not use_chat_history:
-                    st.session_state.rag_session_id = None
+                    if use_chat_history and "sessionId" in response:
+                        st.session_state.rag_session_id = response["sessionId"]
+                    if not use_chat_history:
+                        st.session_state.rag_session_id = None
 
-                ai_answer = response["output"]["text"]
+                    ai_answer = response["output"]["text"]
 
                 response_placeholder.markdown(ai_answer)
 
