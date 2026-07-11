@@ -231,6 +231,39 @@ def _format_history_for_prompt(messages: list[dict], user_query: str, limit: int
     return "\n\n".join(lines)
 
 
+def _select_reference_assistant_context(messages: list[dict], user_query: str) -> str:
+    """CONTEXTUAL_RAGで優先参照するassistant回答を明示する。"""
+    assistant_messages = [
+        message.get("content", "")
+        for message in messages
+        if message.get("role") == "assistant" and message.get("content")
+    ]
+    if not assistant_messages:
+        return ""
+
+    normalized = _normalize_message_text(user_query)
+    selected = []
+
+    if "最初と最後" in normalized:
+        selected = [assistant_messages[0]]
+        if assistant_messages[-1] != assistant_messages[0]:
+            selected.append(assistant_messages[-1])
+    elif "最初の回答" in normalized:
+        selected = [assistant_messages[0]]
+    elif any(keyword in normalized for keyword in ["最後の回答", "直前の回答", "前の回答", "さっきの回答", "先ほどの回答"]):
+        selected = [assistant_messages[-1]]
+    elif any(keyword in normalized for keyword in ["その", "それ", "挙げた", "あった"]):
+        selected = [assistant_messages[-1]]
+    else:
+        selected = assistant_messages[-2:]
+
+    blocks = []
+    for idx, content in enumerate(selected, start=1):
+        blocks.append(f"参照対象assistant回答{idx}:\n{content[:3000]}")
+
+    return "\n\n".join(blocks)
+
+
 def _rule_classify_user_message(user_query: str) -> Optional[str]:
     """明確な表現だけをルールで分類し、曖昧な場合はNoneを返す。"""
     normalized = _normalize_message_text(user_query)
@@ -443,15 +476,22 @@ def rewrite_query_from_history(user_query: str, messages: list[dict], model_id: 
         return "NEED_CLARIFICATION"
 
     history_text = _format_history_for_prompt(messages, user_query, limit=10)
+    reference_context = _select_reference_assistant_context(messages, user_query)
 
     prompt = f"""
 あなたは大学向けRAGチャットボットの検索クエリ書き換え担当です。
-会話履歴と最新のユーザー質問をもとに、Knowledge Base検索に適した自己完結した日本語の質問へ書き換えてください。
+会話履歴、参照対象assistant回答、最新のユーザー質問をもとに、Knowledge Base検索に適した自己完結した日本語の質問へ書き換えてください。
 
 参照対象の優先ルール:
 - 「直前の回答」「前の回答」「さっきの回答」「最後の回答」は最新または直近のアシスタント回答を優先する。
 - 「最初の回答」は現在のチャット内で最初のアシスタント回答を優先する。
 - 「最初と最後」は最初と最新のアシスタント回答を比較対象にする。
+
+書き換え方:
+- 参照対象assistant回答に含まれる箇条書き、書類名、制度名、要約、条件を、検索クエリの前提情報として含める。
+- 「その書類」「それぞれ」などの指示語は、参照対象assistant回答内の具体的な名称に置き換える。
+- 複数の書類や制度が挙がっている場合は、名称を省略せず列挙し、現在の質問で求めている提出先・期限・対象者・条件などと対応させる。
+- 出力はKnowledge Base検索に渡す文章なので、「前提: ...。質問: ...。」のように、参照対象回答の内容と現在の質問意図が両方分かる形にする。
 
 禁止事項:
 - 参照対象の回答に存在しない書類名、制度名、期限、提出先を追加しない。
@@ -465,6 +505,9 @@ def rewrite_query_from_history(user_query: str, messages: list[dict], model_id: 
 
 会話履歴:
 {history_text}
+
+参照対象assistant回答:
+{reference_context}
 
 最新のユーザー質問:
 {user_query}
