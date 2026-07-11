@@ -203,6 +203,34 @@ def _normalize_message_text(text: str) -> str:
     return re.sub(r"\s+", "", text.strip().lower())
 
 
+def _has_any_pattern(text: str, patterns: list[str]) -> bool:
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _format_history_for_prompt(messages: list[dict], user_query: str, limit: int = 10) -> str:
+    """直近履歴を基本に、必要なら最初のassistant回答を追加してプロンプト用に整形する。"""
+    selected_messages = list(messages[-limit:])
+    normalized = _normalize_message_text(user_query)
+
+    if "最初の回答" in normalized:
+        first_assistant = next((message for message in messages if message.get("role") == "assistant"), None)
+        if first_assistant and first_assistant not in selected_messages:
+            selected_messages = [first_assistant] + selected_messages
+
+    lines = []
+    for message in selected_messages:
+        role = message.get("role")
+        if role == "user":
+            label = "ユーザー"
+        elif role == "assistant":
+            label = "アシスタント"
+        else:
+            continue
+        lines.append(f"{label}:\n{message.get('content', '')}")
+
+    return "\n\n".join(lines)
+
+
 def _rule_classify_user_message(user_query: str) -> Optional[str]:
     """明確な表現だけをルールで分類し、曖昧な場合はNoneを返す。"""
     normalized = _normalize_message_text(user_query)
@@ -231,6 +259,41 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         r"後期",
     ]
 
+    contextual_reference_patterns = [
+        r"それ",
+        r"その書類",
+        r"その制度",
+        r"その手続",
+        r"その申請",
+        r"その奨学金",
+        r"それぞれ",
+        r"挙げた書類",
+        r"あった書類",
+        r"あった制度",
+        r"最初の回答にある",
+        r"最初の回答にあった",
+        r"前の回答にある",
+        r"前の回答にあった",
+        r"さっき挙げた",
+        r"さっきの回答にある",
+        r"先ほどの回答にある",
+        r"直前の回答にある",
+    ]
+    contextual_lookup_patterns = [
+        r"提出先",
+        r"どこに提出",
+        r"どこへ提出",
+        r"申請期限",
+        r"期限",
+        r"締切",
+        r"対象者",
+        r"条件",
+        r"必要書類",
+        r"提出書類",
+        r"詳しく教えて",
+        r"違いますか",
+        r"異なりますか",
+    ]
     conversation_reference_patterns = [
         r"さっきの回答",
         r"先ほどの回答",
@@ -270,11 +333,17 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         r"まとめて",
     ]
 
-    if any(re.search(pattern, normalized) for pattern in conversation_reference_patterns):
+    if _has_any_pattern(normalized, contextual_reference_patterns):
+        if _has_any_pattern(normalized, contextual_lookup_patterns):
+            return "CONTEXTUAL_RAG"
+        if not _has_any_pattern(normalized, conversation_rewrite_patterns):
+            return None
+
+    if _has_any_pattern(normalized, conversation_reference_patterns):
         return "CONVERSATION"
 
-    if any(re.search(pattern, normalized) for pattern in conversation_feedback_patterns):
-        has_domain_context = any(re.search(pattern, normalized) for pattern in rag_domain_patterns)
+    if _has_any_pattern(normalized, conversation_feedback_patterns):
+        has_domain_context = _has_any_pattern(normalized, rag_domain_patterns)
         is_question = any(mark in user_query for mark in ["?", "？"]) or re.search(
             r"(ですか|ますか|いつ|何|どこ|誰|どれ|必要|教えて)$",
             normalized
@@ -282,21 +351,21 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         if not (has_domain_context and is_question):
             return "CONVERSATION"
 
-    if any(re.search(pattern, normalized) for pattern in conversation_rewrite_patterns):
-        has_domain_context = any(re.search(pattern, normalized) for pattern in rag_domain_patterns)
+    if _has_any_pattern(normalized, conversation_rewrite_patterns):
+        has_domain_context = _has_any_pattern(normalized, rag_domain_patterns)
         if has_domain_context:
             return None
         if len(normalized) <= 30:
             return "CONVERSATION"
 
-    if any(re.search(pattern, normalized) for pattern in rag_domain_patterns):
+    if _has_any_pattern(normalized, rag_domain_patterns):
         return "RAG"
 
     return None
 
 
 def classify_user_message(user_query: str, messages: list[dict]) -> str:
-    """ユーザー発言をRAGまたはCONVERSATIONに分類する。失敗時は安全側でRAGにする。"""
+    """ユーザー発言をRAG/CONVERSATION/CONTEXTUAL_RAGに分類する。失敗時は安全側でRAGにする。"""
     rule_result = _rule_classify_user_message(user_query)
     if rule_result:
         return rule_result
@@ -309,26 +378,26 @@ def classify_user_message(user_query: str, messages: list[dict]) -> str:
             aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
         )
 
-        recent_messages = messages[-8:]
-        history_text = "\n".join(
-            f"{message['role']}: {message['content']}"
-            for message in recent_messages
-        )
+        history_text = _format_history_for_prompt(messages, user_query, limit=10)
 
         prompt = f"""
 あなたは大学向けチャットボットの入力分類器です。
-ユーザーの最新発言を、次のどちらか1語だけで分類してください。
+ユーザーの最新発言を、次のいずれか1語だけで分類してください。
 
 RAG:
-奨学金、申請、提出書類、期限、制度、規程など、ナレッジベースの情報を検索して回答すべき質問。
+会話履歴を参照しなくても、その質問文だけでナレッジベースを検索できる質問。
 
 CONVERSATION:
-過去の回答への感想、指摘、比較、訂正依頼、要約依頼、言い換え依頼、挨拶など、直前までの会話履歴だけで回答すべき発言。
+ナレッジベース検索は不要で、過去の回答への感想、指摘、比較、訂正依頼、要約、言い換え、挨拶として会話履歴だけで回答すべき発言。
+
+CONTEXTUAL_RAG:
+「それ」「その書類」「前の回答にある制度」「最初の回答にある書類」など、会話履歴を参照しないと検索対象を特定できないが、特定後はナレッジベース検索が必要な質問。
 
 注意:
 - 「前年度の申請期限は？」のように制度・申請内容を聞く場合はRAG。
-- 「前の回答と違う」「さっきの回答を短くして」のように過去回答を扱う場合はCONVERSATION。
-- 必ず RAG または CONVERSATION のどちらか1語だけを返してください。
+- 「前の回答にある申請期限は？」のように過去回答内の対象についてナレッジベース情報を聞く場合はCONTEXTUAL_RAG。
+- 「前の回答と違う」「さっきの回答を短くして」のように過去回答自体を扱う場合はCONVERSATION。
+- 必ず RAG、CONVERSATION、CONTEXTUAL_RAG のいずれか1語だけを返してください。
 
 会話履歴:
 {history_text}
@@ -346,17 +415,79 @@ CONVERSATION:
                 }
             ],
             inferenceConfig={
-                "maxTokens": 10,
+                "maxTokens": 20,
                 "temperature": 0
             }
         )
         label = response["output"]["message"]["content"][0]["text"].strip().upper()
         if label == "CONVERSATION":
             return "CONVERSATION"
+        if label == "CONTEXTUAL_RAG":
+            return "CONTEXTUAL_RAG"
         return "RAG"
 
     except Exception:
         return "RAG"
+
+
+def rewrite_query_from_history(user_query: str, messages: list[dict], model_id: str) -> str:
+    bedrock_runtime = boto3.client(
+        service_name="bedrock-runtime",
+        region_name="ap-northeast-1",
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+    )
+
+    assistant_messages = [message for message in messages if message.get("role") == "assistant"]
+    if not assistant_messages:
+        return "NEED_CLARIFICATION"
+
+    history_text = _format_history_for_prompt(messages, user_query, limit=10)
+
+    prompt = f"""
+あなたは大学向けRAGチャットボットの検索クエリ書き換え担当です。
+会話履歴と最新のユーザー質問をもとに、Knowledge Base検索に適した自己完結した日本語の質問へ書き換えてください。
+
+参照対象の優先ルール:
+- 「直前の回答」「前の回答」「さっきの回答」「最後の回答」は最新または直近のアシスタント回答を優先する。
+- 「最初の回答」は現在のチャット内で最初のアシスタント回答を優先する。
+- 「最初と最後」は最初と最新のアシスタント回答を比較対象にする。
+
+禁止事項:
+- 参照対象の回答に存在しない書類名、制度名、期限、提出先を追加しない。
+- 過去の別質問に出た情報を、参照対象の回答に含まれていたと誤認しない。
+- Knowledge Baseに根拠が必要な提出先や期限を、会話履歴だけで断定しない。
+
+出力ルール:
+- 書き換え後の検索質問のみを1つ返す。
+- 参照対象を特定できない場合だけ NEED_CLARIFICATION と返す。
+- 前置き、説明、引用符、箇条書きは不要。
+
+会話履歴:
+{history_text}
+
+最新のユーザー質問:
+{user_query}
+"""
+
+    response = bedrock_runtime.converse(
+        modelId=model_id,
+        messages=[
+            {
+                "role": "user",
+                "content": [{"text": prompt}]
+            }
+        ],
+        inferenceConfig={
+            "maxTokens": 500,
+            "temperature": 0
+        }
+    )
+
+    rewritten_query = response["output"]["message"]["content"][0]["text"].strip()
+    if not rewritten_query:
+        return user_query
+    return rewritten_query
 
 
 def answer_conversation_with_claude(messages: list[dict], max_tokens: int) -> str:
@@ -368,6 +499,12 @@ def answer_conversation_with_claude(messages: list[dict], max_tokens: int) -> st
     )
 
     recent_messages = messages[-10:]
+    normalized_query = _normalize_message_text(messages[-1]["content"] if messages else "")
+    if "最初の回答" in normalized_query:
+        first_assistant = next((message for message in messages if message.get("role") == "assistant"), None)
+        if first_assistant and first_assistant not in recent_messages:
+            recent_messages = [first_assistant] + recent_messages
+
     while recent_messages and recent_messages[0]["role"] != "user":
         recent_messages = recent_messages[1:]
 
@@ -476,6 +613,9 @@ if "feedback_target" not in st.session_state:
 if "feedback_key_version" not in st.session_state:
     st.session_state.feedback_key_version = {}
 
+if "rag_debug_info" not in st.session_state:
+    st.session_state.rag_debug_info = {}
+
 
 # ==========================================
 #  パスワード認証
@@ -536,6 +676,7 @@ if page == "💬 チャット検証画面":
         st.session_state.messages = []
         st.session_state.feedback_target = None
         st.session_state.feedback_key_version = {}
+        st.session_state.rag_debug_info = {}
         st.session_state.rag_session_id = None
         st.session_state.last_rag_setting_key = None
         st.rerun()
@@ -591,6 +732,11 @@ if page == "💬 チャット検証画面":
         value=False
     )
 
+    show_rag_debug = st.sidebar.checkbox(
+        "RAG処理内容を表示する",
+        value=False
+    )
+
     current_rag_setting_key = (
         KNOWLEDGE_BASE_ID,
         search_type_label,
@@ -606,6 +752,18 @@ if page == "💬 チャット検証画面":
     for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+
+            if show_rag_debug and message["role"] == "assistant":
+                debug_info = st.session_state.rag_debug_info.get(idx)
+                if debug_info:
+                    with st.expander("RAG処理内容"):
+                        st.write(f"分類結果: {debug_info.get('message_type', '')}")
+                        st.write(f"元のユーザー質問: {debug_info.get('original_query', '')}")
+                        if debug_info.get("rewritten_query"):
+                            st.write(f"書き換え後の検索クエリ: {debug_info.get('rewritten_query', '')}")
+                        st.write(f"Knowledge Base ID: {debug_info.get('knowledge_base_id', '')}")
+                        st.write(f"Search Type: {debug_info.get('search_type', '')}")
+                        st.write(f"Top K: {debug_info.get('top_k', '')}")
 
         if message["role"] == "assistant":
             version = st.session_state.feedback_key_version.get(idx, 0)
@@ -638,6 +796,7 @@ if page == "💬 チャット検証画面":
     
     if user_query:
         st.session_state.messages.append({"role": "user", "content": user_query})
+        assistant_message_index = len(st.session_state.messages)
 
         with st.chat_message("user"):
             st.markdown(user_query)
@@ -647,6 +806,7 @@ if page == "💬 チャット検証画面":
 
             try:
                 message_type = classify_user_message(user_query, st.session_state.messages)
+                rewritten_query = None
 
                 if message_type == "CONVERSATION":
                     ai_answer = answer_conversation_with_claude(
@@ -654,6 +814,41 @@ if page == "💬 チャット検証画面":
                         max_tokens=max_tokens
                     )
                 else:
+                    rag_input_text = user_query
+
+                    if message_type == "CONTEXTUAL_RAG":
+                        try:
+                            rewritten_query = rewrite_query_from_history(
+                                user_query=user_query,
+                                messages=st.session_state.messages,
+                                model_id=CHAT_MODEL_ID
+                            )
+                            if rewritten_query == "NEED_CLARIFICATION":
+                                ai_answer = (
+                                    "どの回答を指しているか確認させてください。"
+                                    "直前の回答でしょうか、それともこの会話の最初の回答でしょうか。"
+                                )
+                                response_placeholder.markdown(ai_answer)
+
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": ai_answer
+                                })
+                                st.session_state.rag_debug_info[assistant_message_index] = {
+                                    "message_type": message_type,
+                                    "original_query": user_query,
+                                    "rewritten_query": "",
+                                    "knowledge_base_id": KNOWLEDGE_BASE_ID,
+                                    "search_type": search_type_label,
+                                    "top_k": top_k
+                                }
+                                st.rerun()
+
+                            rag_input_text = rewritten_query
+                        except Exception:
+                            rewritten_query = user_query
+                            rag_input_text = user_query
+
                     aws_filter = None
 
                     if target_user == "学生":
@@ -700,17 +895,20 @@ if page == "💬 チャット検証画面":
                                     "あなたは大学の奨学金業務のベテラン職員です。"
                                     "提供された検索結果（マニュアルや規程の資料）を最優先の根拠として回答してください。"
                                     "資料に記載されていない内容は推測してはいけません。"
-                                    "ただし、ユーザーが過去の会話内容や以前の回答との比較・確認を求めた場合は、"
-                                    "現在の会話履歴も参照し、その内容を踏まえて回答してください。\n\n"
                                     "【重要な指示】\n"
                                     "1. 検索結果の資料内に、必要書類の名前や対象者の条件が断片的にでも記載されている場合は、"
                                     "見つかった書類名や条件をすべて漏れなく箇条書きで出力してください。\n"
                                     "2. 資料に記載されている具体的な書類名は省略せず、正式名称のまま出力してください。\n"
                                     "3. 資料に書かれていない内容は推測しないでください。\n"
-                                    "4. ユーザーが『前の回答』『先ほどの回答』『最初の回答』『以前との違い』など、"
-                                    "会話履歴に関する質問をした場合は、検索結果だけでなく会話履歴も参照して回答してください。\n\n"
+                                    "4. ユーザーの元の質問が過去の会話を参照している場合は、"
+                                    "検索用に具体化された質問をもとに、元の質問への自然な回答として出力してください。\n"
+                                    "5. 書類や制度が複数ある場合は、それぞれの提出先や条件を対応関係が分かる形で列挙してください。\n"
+                                    "6. Knowledge Baseに情報がない項目は、存在するように推測しないでください。\n"
+                                    "7. 一部だけ情報が見つかった場合は、見つかった項目と見つからなかった項目を分けて回答してください。\n"
+                                    "8. 過去のassistant回答に書かれていた内容を、Knowledge Baseの根拠なしに事実として断定しないでください。\n\n"
+                                    f"ユーザーの元の質問: {user_query}\n\n"
                                     "検索結果:\n$search_results$\n\n"
-                                    "ユーザーの質問: $query$"
+                                    "検索用に具体化された質問: $query$"
                                 )
                             }
                         }
@@ -720,7 +918,7 @@ if page == "💬 チャット検証画面":
                         kb_config["retrievalConfiguration"]["vectorSearchConfiguration"]["filter"] = aws_filter
 
                     retrieve_params = {
-                        "input": {"text": user_query},
+                        "input": {"text": rag_input_text},
                         "retrieveAndGenerateConfiguration": {
                             "type": "KNOWLEDGE_BASE",
                             "knowledgeBaseConfiguration": kb_config
@@ -744,6 +942,14 @@ if page == "💬 チャット検証画面":
                     "role": "assistant",
                     "content": ai_answer
                 })
+                st.session_state.rag_debug_info[assistant_message_index] = {
+                    "message_type": message_type,
+                    "original_query": user_query,
+                    "rewritten_query": rewritten_query if message_type == "CONTEXTUAL_RAG" else "",
+                    "knowledge_base_id": KNOWLEDGE_BASE_ID,
+                    "search_type": search_type_label,
+                    "top_k": top_k
+                }
 
                 st.rerun()
 
