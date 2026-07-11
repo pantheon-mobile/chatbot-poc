@@ -828,12 +828,12 @@ if page == "💬 チャット検証画面":
 
     use_chat_history = st.sidebar.checkbox(
         "会話履歴を利用する",
-        value=False
+        value=True
     )
 
     show_rag_debug = st.sidebar.checkbox(
         "RAG処理内容を表示する",
-        value=False
+        value=True
     )
 
     current_rag_setting_key = (
