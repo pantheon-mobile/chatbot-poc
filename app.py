@@ -231,37 +231,61 @@ def _format_history_for_prompt(messages: list[dict], user_query: str, limit: int
     return "\n\n".join(lines)
 
 
-def _select_reference_assistant_context(messages: list[dict], user_query: str) -> str:
-    """CONTEXTUAL_RAGで優先参照するassistant回答を明示する。"""
+def _select_reference_assistant_info(messages: list[dict], user_query: str) -> dict:
+    """CONTEXTUAL_RAGで優先参照するassistant回答と位置を返す。"""
     assistant_messages = [
-        message.get("content", "")
-        for message in messages
+        (idx, message.get("content", ""))
+        for idx, message in enumerate(messages)
         if message.get("role") == "assistant" and message.get("content")
     ]
     if not assistant_messages:
-        return ""
+        return {
+            "label": "",
+            "content": "",
+            "message_indexes": [],
+            "context": ""
+        }
 
     normalized = _normalize_message_text(user_query)
     selected = []
+    label = ""
 
     if "最初と最後" in normalized:
         selected = [assistant_messages[0]]
-        if assistant_messages[-1] != assistant_messages[0]:
+        label = "最初と最新のassistant回答"
+        if assistant_messages[-1][0] != assistant_messages[0][0]:
             selected.append(assistant_messages[-1])
     elif "最初の回答" in normalized:
         selected = [assistant_messages[0]]
+        label = "最初のassistant回答"
     elif any(keyword in normalized for keyword in ["最後の回答", "直前の回答", "前の回答", "さっきの回答", "先ほどの回答"]):
         selected = [assistant_messages[-1]]
-    elif any(keyword in normalized for keyword in ["その", "それ", "挙げた", "あった"]):
+        label = "直前のassistant回答"
+    elif any(keyword in normalized for keyword in ["その書類", "その制度", "その手続", "その申請", "その奨学金", "それぞれ", "挙げた", "あった"]):
         selected = [assistant_messages[-1]]
+        label = "直前のassistant回答"
     else:
-        selected = assistant_messages[-2:]
+        selected = [assistant_messages[-1]]
+        label = "直前のassistant回答"
 
     blocks = []
-    for idx, content in enumerate(selected, start=1):
-        blocks.append(f"参照対象assistant回答{idx}:\n{content[:3000]}")
+    contents = []
+    indexes = []
+    for block_idx, (message_idx, content) in enumerate(selected, start=1):
+        indexes.append(message_idx)
+        contents.append(content)
+        blocks.append(f"参照対象assistant回答{block_idx}:\n{content[:3000]}")
 
-    return "\n\n".join(blocks)
+    return {
+        "label": label,
+        "content": "\n\n".join(contents),
+        "message_indexes": indexes,
+        "context": "\n\n".join(blocks)
+    }
+
+
+def _select_reference_assistant_context(messages: list[dict], user_query: str) -> str:
+    return _select_reference_assistant_info(messages, user_query)["context"]
 
 
 def _rule_classify_user_message(user_query: str) -> Optional[str]:
@@ -285,6 +309,15 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         r"対象者",
         r"条件",
         r"手続",
+        r"手続き",
+        r"提出先",
+        r"提出方法",
+        r"申請方法",
+        r"窓口",
+        r"郵送先",
+        r"受付時間",
+        r"金額",
+        r"制度名",
         r"前年度",
         r"今年度",
         r"来年度",
@@ -303,10 +336,14 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         r"挙げた書類",
         r"あった書類",
         r"あった制度",
+        r"最初の回答の",
         r"最初の回答にある",
         r"最初の回答にあった",
+        r"前の回答の",
         r"前の回答にある",
         r"前の回答にあった",
+        r"直前の回答の",
+        r"さっきの回答の",
         r"さっき挙げた",
         r"さっきの回答にある",
         r"先ほどの回答にある",
@@ -314,6 +351,7 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
     ]
     contextual_lookup_patterns = [
         r"提出先",
+        r"提出方法",
         r"どこに提出",
         r"どこへ提出",
         r"申請期限",
@@ -321,9 +359,18 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         r"締切",
         r"対象者",
         r"条件",
+        r"申請方法",
+        r"窓口",
+        r"郵送先",
+        r"受付時間",
+        r"金額",
+        r"制度名",
+        r"手続き",
+        r"手続",
         r"必要書類",
         r"提出書類",
         r"詳しく教えて",
+        r"具体的に教えて",
         r"違いますか",
         r"異なりますか",
     ]
@@ -364,12 +411,18 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         r"要約して",
         r"言い換えて",
         r"まとめて",
+        r"箇条書きにして",
     ]
 
+    has_context_reference = _has_any_pattern(normalized, contextual_reference_patterns)
+    has_lookup_intent = _has_any_pattern(normalized, contextual_lookup_patterns)
+    has_conversation_rewrite = _has_any_pattern(normalized, conversation_rewrite_patterns)
+
+    if has_context_reference and has_lookup_intent:
+        return "CONTEXTUAL_RAG"
+
     if _has_any_pattern(normalized, contextual_reference_patterns):
-        if _has_any_pattern(normalized, contextual_lookup_patterns):
-            return "CONTEXTUAL_RAG"
-        if not _has_any_pattern(normalized, conversation_rewrite_patterns):
+        if not has_conversation_rewrite:
             return None
 
     if _has_any_pattern(normalized, conversation_reference_patterns):
@@ -384,7 +437,7 @@ def _rule_classify_user_message(user_query: str) -> Optional[str]:
         if not (has_domain_context and is_question):
             return "CONVERSATION"
 
-    if _has_any_pattern(normalized, conversation_rewrite_patterns):
+    if has_conversation_rewrite:
         has_domain_context = _has_any_pattern(normalized, rag_domain_patterns)
         if has_domain_context:
             return None
@@ -428,8 +481,11 @@ CONTEXTUAL_RAG:
 
 注意:
 - 「前年度の申請期限は？」のように制度・申請内容を聞く場合はRAG。
+- 「提出先」「提出方法」「必要書類」「期限」「対象者」「条件」「申請方法」「窓口」「郵送先」「受付時間」「金額」「制度名」「手続き」などの業務情報を求め、かつ過去の回答や「その」「それぞれ」を参照している場合はCONTEXTUAL_RAGを優先する。
+- 「最初の回答の書類の提出先は？」はCONTEXTUAL_RAG。
 - 「前の回答にある申請期限は？」のように過去回答内の対象についてナレッジベース情報を聞く場合はCONTEXTUAL_RAG。
 - 「前の回答と違う」「さっきの回答を短くして」のように過去回答自体を扱う場合はCONVERSATION。
+- 「もっと具体的に教えて」は、直前の話題について追加の事実情報を求めている場合はCONTEXTUAL_RAG、単なる言い換えや説明改善ならCONVERSATION。
 - 必ず RAG、CONVERSATION、CONTEXTUAL_RAG のいずれか1語だけを返してください。
 
 会話履歴:
@@ -802,6 +858,13 @@ if page == "💬 チャット検証画面":
                     with st.expander("RAG処理内容"):
                         st.write(f"分類結果: {debug_info.get('message_type', '')}")
                         st.write(f"元のユーザー質問: {debug_info.get('original_query', '')}")
+                        if debug_info.get("reference_label"):
+                            st.write(f"参照対象: {debug_info.get('reference_label', '')}")
+                        if debug_info.get("reference_message_indexes"):
+                            st.write(f"参照対象のメッセージ位置: {debug_info.get('reference_message_indexes', '')}")
+                        if debug_info.get("reference_answer"):
+                            st.write("参照した回答:")
+                            st.text(debug_info.get("reference_answer", ""))
                         if debug_info.get("rewritten_query"):
                             st.write(f"書き換え後の検索クエリ: {debug_info.get('rewritten_query', '')}")
                         st.write(f"Knowledge Base ID: {debug_info.get('knowledge_base_id', '')}")
@@ -850,6 +913,12 @@ if page == "💬 チャット検証画面":
             try:
                 message_type = classify_user_message(user_query, st.session_state.messages)
                 rewritten_query = None
+                reference_info = {
+                    "label": "",
+                    "content": "",
+                    "message_indexes": [],
+                    "context": ""
+                }
 
                 if message_type == "CONVERSATION":
                     ai_answer = answer_conversation_with_claude(
@@ -860,6 +929,31 @@ if page == "💬 チャット検証画面":
                     rag_input_text = user_query
 
                     if message_type == "CONTEXTUAL_RAG":
+                        reference_info = _select_reference_assistant_info(
+                            st.session_state.messages,
+                            user_query
+                        )
+                        if not reference_info["content"]:
+                            ai_answer = "どの回答を指していますか？"
+                            response_placeholder.markdown(ai_answer)
+
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": ai_answer
+                            })
+                            st.session_state.rag_debug_info[assistant_message_index] = {
+                                "message_type": message_type,
+                                "original_query": user_query,
+                                "rewritten_query": "",
+                                "reference_label": "",
+                                "reference_answer": "",
+                                "reference_message_indexes": [],
+                                "knowledge_base_id": KNOWLEDGE_BASE_ID,
+                                "search_type": search_type_label,
+                                "top_k": top_k
+                            }
+                            st.rerun()
+
                         try:
                             rewritten_query = rewrite_query_from_history(
                                 user_query=user_query,
@@ -881,6 +975,9 @@ if page == "💬 チャット検証画面":
                                     "message_type": message_type,
                                     "original_query": user_query,
                                     "rewritten_query": "",
+                                    "reference_label": reference_info["label"],
+                                    "reference_answer": reference_info["content"],
+                                    "reference_message_indexes": reference_info["message_indexes"],
                                     "knowledge_base_id": KNOWLEDGE_BASE_ID,
                                     "search_type": search_type_label,
                                     "top_k": top_k
@@ -948,8 +1045,13 @@ if page == "💬 チャット検証画面":
                                     "5. 書類や制度が複数ある場合は、それぞれの提出先や条件を対応関係が分かる形で列挙してください。\n"
                                     "6. Knowledge Baseに情報がない項目は、存在するように推測しないでください。\n"
                                     "7. 一部だけ情報が見つかった場合は、見つかった項目と見つからなかった項目を分けて回答してください。\n"
-                                    "8. 過去のassistant回答に書かれていた内容を、Knowledge Baseの根拠なしに事実として断定しないでください。\n\n"
+                                    "8. 検索結果に情報が存在しない場合でも、参照対象となる会話履歴に明示されている事実は、"
+                                    "Knowledge Baseの内容と矛盾しない範囲で回答に含めてください。\n"
+                                    "9. ただし、会話履歴にない内容やKnowledge Baseに反する内容を推測してはいけません。\n"
+                                    "10. Knowledge Baseと過去回答が矛盾する場合はKnowledge Baseを優先してください。\n"
+                                    "11. 提出先が大学窓口と日本学生支援機構郵送で異なる場合は、明確に区別してください。\n\n"
                                     f"ユーザーの元の質問: {user_query}\n\n"
+                                    f"参照対象assistant回答:\n{reference_info['context']}\n\n"
                                     "検索結果:\n$search_results$\n\n"
                                     "検索用に具体化された質問: $query$"
                                 )
@@ -989,6 +1091,9 @@ if page == "💬 チャット検証画面":
                     "message_type": message_type,
                     "original_query": user_query,
                     "rewritten_query": rewritten_query if message_type == "CONTEXTUAL_RAG" else "",
+                    "reference_label": reference_info["label"],
+                    "reference_answer": reference_info["content"],
+                    "reference_message_indexes": reference_info["message_indexes"],
                     "knowledge_base_id": KNOWLEDGE_BASE_ID,
                     "search_type": search_type_label,
                     "top_k": top_k
