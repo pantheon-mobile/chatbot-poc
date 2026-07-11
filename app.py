@@ -250,6 +250,12 @@ if "authenticated" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "rag_session_id" not in st.session_state:
+    st.session_state.rag_session_id = None
+
+if "last_rag_setting_key" not in st.session_state:
+    st.session_state.last_rag_setting_key = None
+
 if "feedback_target" not in st.session_state:
     st.session_state.feedback_target = None
 
@@ -316,6 +322,8 @@ if page == "💬 チャット検証画面":
         st.session_state.messages = []
         st.session_state.feedback_target = None
         st.session_state.feedback_key_version = {}
+        st.session_state.rag_session_id = None
+        st.session_state.last_rag_setting_key = None
         st.rerun()
 
     target_user = st.radio(
@@ -363,6 +371,22 @@ if page == "💬 チャット検証画面":
         [1000, 2000, 4000],
         index=2
     )
+
+    use_chat_history = st.sidebar.checkbox(
+        "会話履歴を利用する",
+        value=False
+    )
+
+    current_rag_setting_key = (
+        KNOWLEDGE_BASE_ID,
+        search_type_label,
+        top_k,
+        max_tokens,
+        target_user
+    )
+    if st.session_state.last_rag_setting_key != current_rag_setting_key:
+        st.session_state.rag_session_id = None
+        st.session_state.last_rag_setting_key = current_rag_setting_key
 
     # 既存メッセージ表示
     for idx, message in enumerate(st.session_state.messages):
@@ -469,13 +493,22 @@ if page == "💬 チャット検証画面":
                 if aws_filter:
                     kb_config["retrievalConfiguration"]["vectorSearchConfiguration"]["filter"] = aws_filter
 
-                response = bedrock_agent_runtime.retrieve_and_generate(
-                    input={"text": user_query},
-                    retrieveAndGenerateConfiguration={
+                retrieve_params = {
+                    "input": {"text": user_query},
+                    "retrieveAndGenerateConfiguration": {
                         "type": "KNOWLEDGE_BASE",
                         "knowledgeBaseConfiguration": kb_config
                     }
-                )
+                }
+                if use_chat_history and st.session_state.rag_session_id:
+                    retrieve_params["sessionId"] = st.session_state.rag_session_id
+
+                response = bedrock_agent_runtime.retrieve_and_generate(**retrieve_params)
+
+                if use_chat_history and "sessionId" in response:
+                    st.session_state.rag_session_id = response["sessionId"]
+                if not use_chat_history:
+                    st.session_state.rag_session_id = None
 
                 ai_answer = response["output"]["text"]
 
