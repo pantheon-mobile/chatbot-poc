@@ -5,6 +5,8 @@ LIST_HTML = """
 <html><main><nav class="breadcrumb"><span>予約採用</span><span>通知</span></nav>
 <a href="/faq/detail1.html">Q 質問ですか。（2026年4月更新）</a>
 <a href="/faq/detail1.html">Q 質問ですか。（2026年4月更新）</a>
+<a href="/faq/category/1214014_2903.html">多子世帯と判定されていないのはなぜですか。（2026年4月更新）</a>
+<a href="/faq/category/index.html">カテゴリ一覧</a>
 </main></html>
 """
 DETAIL_HTML = """
@@ -13,13 +15,22 @@ DETAIL_HTML = """
 <h2>A</h2><div><p>回答の第1段落。</p><ul><li>項目1</li><li>項目2</li></ul></div>
 </main></html>
 """
+CURRENT_DETAIL_HTML = """
+<html><main>
+<section class="p-section p-section--faq">
+  <h2 class="p-faq-q">現在の質問ですか。</h2>
+  <div class="p-section-content p-faq-a"><p>現在の回答です。</p></div>
+</section>
+</main></html>
+"""
 
 
 def test_faq_link_update_and_duplicate_deduplication():
     links = parse_faq_links(LIST_HTML, "https://www.jasso.go.jp/faq/list.html", ("予約採用", "通知"))
-    assert len(links) == 1
+    assert len(links) == 2
     assert links[0].question == "質問ですか。"
     assert links[0].source_updated_year == 2026
+    assert links[1].question == "多子世帯と判定されていないのはなぜですか。"
 
 
 def test_detail_parser():
@@ -29,6 +40,13 @@ def test_detail_parser():
     assert "回答の第1段落。" in item.answer
     assert "項目1" in item.answer
     assert item.category_path == "予約採用 > 通知"
+
+
+def test_current_faq_class_detail_parser():
+    link = parse_faq_links(LIST_HTML, "https://www.jasso.go.jp/faq/list.html", ("予約採用", "通知"))[0]
+    item = parse_detail(CURRENT_DETAIL_HTML, link.url, link)
+    assert item.question == "現在の質問ですか。"
+    assert item.answer == "現在の回答です。"
 
 
 def test_login_selects_password_form_after_search_form(monkeypatch):

@@ -1469,7 +1469,10 @@ elif page == "🌐 JASSO Q&A取得":
         count_area = st.empty()
 
         def update_jasso_progress(info):
-            category_area.info(f"現在処理中のカテゴリ: {info.get('category') or 'カテゴリルート'}")
+            category_area.info(
+                f"{info.get('phase', '処理中')} — "
+                f"現在のカテゴリ: {info.get('category') or 'カテゴリルート'}"
+            )
             url_area.code(info.get("url", ""))
             count_area.write(
                 f"取得済みQ&A: {info.get('count', 0)}件 / エラー: {info.get('errors', 0)}件"

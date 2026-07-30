@@ -28,10 +28,12 @@ class JassoSelectors:
         "nav[aria-label*=パンくず]", ".breadcrumb", "#breadcrumb", "[class*=topicpath]"
     )
     question_block: tuple[str, ...] = (
-        "[itemprop=name]", ".question", ".faq-question", "[class*=question]", "[id*=question]"
+        "[itemprop=name]", ".p-faq-q", "[class*=faq-q]",
+        ".question", ".faq-question", "[class*=question]", "[id*=question]"
     )
     answer_block: tuple[str, ...] = (
-        "[itemprop=acceptedAnswer]", ".answer", ".faq-answer", "[class*=answer]", "[id*=answer]"
+        "[itemprop=acceptedAnswer]", ".p-faq-a", "[class*=faq-a]",
+        ".answer", ".faq-answer", "[class*=answer]", "[id*=answer]"
     )
 
 
@@ -85,8 +87,14 @@ def parse_faq_links(html: str, page_url: str, category_path: tuple[str, ...]) ->
         question = strip_update(clean)
         # JASSO FAQ questions are explicitly prefixed Q; href patterns are only a fallback.
         looks_like_q = bool(re.match(r"^\s*Q(?:\s|[:：])", text, re.I))
-        looks_like_detail = bool(re.search(r"(?:detail|faq|question|qa)", urlsplit(url).path, re.I))
-        if url not in seen and question and (looks_like_q or ("?" in question and looks_like_detail)):
+        path = urlsplit(url).path
+        # Current authenticated pages omit the visible "Q" prefix. Their detail
+        # pages use a numeric content ID filename; category/list pages are index.html.
+        looks_like_detail = bool(
+            re.search(r"/\d+_\d+\.html$", path, re.I)
+            or re.search(r"/(?:detail|question|qa)[^/]*\.html$", path, re.I)
+        )
+        if url not in seen and question and (looks_like_q or looks_like_detail):
             seen.add(url)
             output.append(FAQLink(url, question, category_path, updated_text, year, month))
     return output
@@ -272,7 +280,8 @@ class JassoCrawler:
                 continue
             visited_pages.add(url)
             if progress:
-                progress({"category": " > ".join(page.category_path), "url": url,
+                progress({"phase": "カテゴリページ取得中",
+                          "category": " > ".join(page.category_path), "url": url,
                           "count": len(result.faqs), "errors": len(result.errors)})
             try:
                 html = self._get(url)
@@ -286,9 +295,19 @@ class JassoCrawler:
                     detail_urls.add(link.url)
                     try:
                         result.faqs.append(parse_detail(self._get(link.url), link.url, link))
+                        if progress:
+                            progress({"phase": "Q&A詳細取得中",
+                                      "category": " > ".join(link.category_path),
+                                      "url": link.url, "count": len(result.faqs),
+                                      "errors": len(result.errors)})
                     except Exception as exc:
                         self._debug_html(link.url, self.cache.get(link.url, ""))
                         result.errors.append(CrawlError(link.url, str(exc), " > ".join(link.category_path)))
+                        if progress:
+                            progress({"phase": "Q&A解析エラー",
+                                      "category": " > ".join(link.category_path),
+                                      "url": link.url, "count": len(result.faqs),
+                                      "errors": len(result.errors)})
                 for label, child_url in _visible_links(_main(soup), url):
                     if child_url in faq_url_set or child_url in visited_pages:
                         continue
@@ -299,6 +318,10 @@ class JassoCrawler:
                         pending.append(CrawlPage(child_url, next_path, url))
             except Exception as exc:
                 result.errors.append(CrawlError(url, str(exc), " > ".join(page.category_path)))
+                if progress:
+                    progress({"phase": "カテゴリページ取得エラー",
+                              "category": " > ".join(page.category_path), "url": url,
+                              "count": len(result.faqs), "errors": len(result.errors)})
                 if "401" in str(exc) or "403" in str(exc):
                     break
         return result
