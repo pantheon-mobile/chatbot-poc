@@ -1,5 +1,5 @@
 from jasso_utils import (
-    extract_update, make_content_hash, make_qa_id, normalize_text,
+    extract_update, is_allowed_jasso_url, make_content_hash, make_qa_id, normalize_text,
     normalize_url, strip_update,
 )
 
@@ -27,3 +27,9 @@ def test_update_variants_and_strip():
 
 def test_content_hash_is_normalized_and_stable():
     assert make_content_hash(" 質問 ", "回答\nです") == make_content_hash("質問", "回答\nです")
+
+
+def test_authenticated_host_is_limited_to_root_host():
+    root = "https://www2.jasso.go.jp/daigaku/faq/index.html"
+    assert is_allowed_jasso_url("https://www2.jasso.go.jp/daigaku/faq/a.html", root)
+    assert not is_allowed_jasso_url("https://www.jasso.go.jp/daigaku/faq/a.html", root)

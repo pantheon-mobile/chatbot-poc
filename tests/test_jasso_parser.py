@@ -46,21 +46,31 @@ def test_login_selects_password_form_after_search_form(monkeypatch):
     calls = []
 
     class Response:
-        def __init__(self, url, text):
-            self.url, self.text = url, text
+        def __init__(self, url, text, json_data=None):
+            self.url, self.text, self.json_data = url, text, json_data
+
+        def json(self):
+            if self.json_data is None:
+                raise ValueError
+            return self.json_data
 
     def fake_request(method, url, **kwargs):
         calls.append((method, url, kwargs))
         if len(calls) == 1:
             return Response("https://www.jasso.go.jp/tantosha_login.html", login_html)
         if len(calls) == 2:
-            return Response(url, logged_in_html)
+            return Response(
+                url, '{"success":true,"url":"https://www2.jasso.go.jp/index.html"}',
+                {"success": True, "url": "https://www2.jasso.go.jp/index.html"},
+            )
+        if len(calls) == 3:
+            return Response("https://www2.jasso.go.jp/index.html", logged_in_html)
         return Response(url, school_html)
 
     crawler = JassoCrawler("user", "secret")
     monkeypatch.setattr(crawler, "_request", fake_request)
     faq_url, _ = crawler.login()
-    assert faq_url == "https://www.jasso.go.jp/school/faq/"
+    assert faq_url == "https://www2.jasso.go.jp/school/faq/"
     assert calls[1][2]["data"] == {
         "_token": "token", "login_id": "user",
         "login_pass": "secret", "login_submit": "ログイン",

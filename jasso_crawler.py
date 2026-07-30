@@ -219,6 +219,21 @@ class JassoCrawler:
                 payload[submit["name"]] = submit.get("value", "")
         action = urljoin(response.url, form.get("action") or response.url)
         logged_in = self._request((form.get("method") or "post").upper(), action, data=payload)
+        login_payload = None
+        try:
+            login_payload = logged_in.json()
+        except (requests.JSONDecodeError, ValueError):
+            pass
+        if isinstance(login_payload, dict):
+            if not login_payload.get("success") or not login_payload.get("url"):
+                raise RuntimeError(
+                    "JASSOへのログインを確認できませんでした。"
+                    "ID、パスワード、ログイン画面の変更を確認してください。"
+                )
+            landing_url = normalize_url(str(login_payload["url"]), logged_in.url)
+            if urlsplit(landing_url).hostname not in ("www.jasso.go.jp", "www2.jasso.go.jp"):
+                raise RuntimeError("JASSOログイン後の遷移先ドメインを確認できませんでした。")
+            logged_in = self._request("GET", landing_url)
         school_url = _find_link(BeautifulSoup(logged_in.text, "lxml"), SCHOOL_LINK, logged_in.url)
         if not school_url:
             raise RuntimeError("JASSOへのログインを確認できませんでした。ID、パスワード、ログイン画面の変更を確認してください。")

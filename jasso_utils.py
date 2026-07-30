@@ -43,7 +43,13 @@ def normalize_url(url: str, base_url: str = "") -> str:
 
 def is_allowed_jasso_url(url: str, root_url: str = "") -> bool:
     parts = urlsplit(url)
-    if parts.hostname != "www.jasso.go.jp":
+    # The public login form is on www.jasso.go.jp, while a successful login
+    # currently hands the session to the authenticated www2.jasso.go.jp host.
+    root_host = urlsplit(root_url).hostname if root_url else ""
+    if root_host:
+        if parts.hostname != root_host:
+            return False
+    elif parts.hostname not in ("www.jasso.go.jp", "www2.jasso.go.jp"):
         return False
     if re.search(r"\.(?:pdf|docx?|xlsx?|xls|jpe?g|png|gif|zip)(?:$|\?)", parts.path, re.I):
         return False
