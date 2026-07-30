@@ -110,3 +110,26 @@ def test_login_selects_password_form_after_search_form(monkeypatch):
         "_token": "token", "login_id": "user",
         "login_pass": "secret", "login_submit": "ログイン",
     }
+
+
+def test_crawl_defers_root_featured_question_to_category_json(monkeypatch):
+    root = "https://www2.jasso.go.jp/daigaku/faq/index.html"
+    category = "https://www2.jasso.go.jp/daigaku/faq/category/index.html"
+    detail = "https://www2.jasso.go.jp/daigaku/faq/category/1216141_2871.html"
+    pages = {
+        root: f"""<main>
+          <a href="{detail}">トップ掲載の質問ですか。</a>
+          <a href="{category}">採用候補者決定通知</a>
+        </main>""",
+        category: '<main><div id="faq-result"></div></main>',
+        "https://www2.jasso.go.jp/daigaku/faq/category/faq.json":
+            '{"data":[{"title":"トップ掲載の質問ですか。","url":"1216141_2871.html"}]}',
+        detail: CURRENT_DETAIL_HTML,
+    }
+    crawler = JassoCrawler("user", "secret")
+    monkeypatch.setattr(crawler, "login", lambda: (root, ""))
+    monkeypatch.setattr(crawler, "_get", lambda url: pages[url])
+    result = crawler.crawl()
+    assert len(result.faqs) == 1
+    assert result.faqs[0].category_path == "採用候補者決定通知"
+    assert not result.errors

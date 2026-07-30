@@ -311,7 +311,15 @@ class JassoCrawler:
                 html = self._get(url)
                 soup = BeautifulSoup(html, "lxml")
                 path = _heading_category_path(soup, page.category_path)
-                faq_links = parse_faq_links(html, url, path)
+                html_faq_links = parse_faq_links(html, url, path)
+                # The FAQ root contains a handful of featured questions without
+                # their category context. Remember their URLs so they are not
+                # traversed as category pages, but defer extraction until the
+                # canonical category faq.json is visited.
+                root_featured_urls = (
+                    {link.url for link in html_faq_links} if url == root_url else set()
+                )
+                faq_links = [] if url == root_url else html_faq_links
                 # Category result lists are populated by faq_bundle.js from a
                 # same-directory JSON endpoint, so requests must fetch it explicitly.
                 if soup.select_one("#faq-result"):
@@ -328,7 +336,7 @@ class JassoCrawler:
                             ))
                 # Top-page HTML and faq.json can contain the same detail link.
                 faq_links = list({link.url: link for link in faq_links}.values())
-                faq_url_set = {x.url for x in faq_links}
+                faq_url_set = root_featured_urls | {x.url for x in faq_links}
                 for link in faq_links:
                     if link.url in detail_urls or not is_allowed_jasso_url(link.url, root_url):
                         continue
