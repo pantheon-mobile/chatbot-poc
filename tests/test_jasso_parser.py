@@ -1,4 +1,4 @@
-from jasso_crawler import parse_detail, parse_faq_links
+from jasso_crawler import JassoCrawler, parse_detail, parse_faq_links
 
 
 LIST_HTML = """
@@ -29,3 +29,39 @@ def test_detail_parser():
     assert "回答の第1段落。" in item.answer
     assert "項目1" in item.answer
     assert item.category_path == "予約採用 > 通知"
+
+
+def test_login_selects_password_form_after_search_form(monkeypatch):
+    login_html = """
+    <form action="/search"><input type="search" name="search"></form>
+    <form action="/tantosha_login.html" method="post">
+      <input type="hidden" name="_token" value="token">
+      <input type="text" name="login_id">
+      <input type="password" name="login_pass">
+      <input type="submit" name="login_submit" value="ログイン">
+    </form>
+    """
+    logged_in_html = '<main><a href="/school/">大学・大学院・短大・高専・専修学校 専門課程</a></main>'
+    school_html = '<main><a href="/school/faq/">よくあるご質問</a></main>'
+    calls = []
+
+    class Response:
+        def __init__(self, url, text):
+            self.url, self.text = url, text
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if len(calls) == 1:
+            return Response("https://www.jasso.go.jp/tantosha_login.html", login_html)
+        if len(calls) == 2:
+            return Response(url, logged_in_html)
+        return Response(url, school_html)
+
+    crawler = JassoCrawler("user", "secret")
+    monkeypatch.setattr(crawler, "_request", fake_request)
+    faq_url, _ = crawler.login()
+    assert faq_url == "https://www.jasso.go.jp/school/faq/"
+    assert calls[1][2]["data"] == {
+        "_token": "token", "login_id": "user",
+        "login_pass": "secret", "login_submit": "ログイン",
+    }

@@ -195,7 +195,13 @@ class JassoCrawler:
     def login(self) -> tuple[str, str]:
         response = self._request("GET", LOGIN_URL)
         soup = BeautifulSoup(response.text, "lxml")
-        form = soup.find("form")
+        # The page also contains a site-search form before the login form.
+        # Select by the semantic presence of a password control, not by position.
+        form = next(
+            (candidate for candidate in soup.find_all("form")
+             if candidate.find("input", {"type": lambda value: (value or "").lower() == "password"})),
+            None,
+        )
         if not form:
             raise RuntimeError("JASSOログインフォームが見つかりませんでした。")
         payload = {x.get("name"): x.get("value", "") for x in form.find_all("input", type="hidden") if x.get("name")}
@@ -207,6 +213,10 @@ class JassoCrawler:
             raise RuntimeError("JASSOログイン入力欄を特定できませんでした。")
         payload[user_input["name"]] = self.user_id
         payload[password_input["name"]] = self.password
+        for submit in form.find_all(["input", "button"]):
+            submit_type = (submit.get("type") or "").lower()
+            if submit_type == "submit" and submit.get("name"):
+                payload[submit["name"]] = submit.get("value", "")
         action = urljoin(response.url, form.get("action") or response.url)
         logged_in = self._request((form.get("method") or "post").upper(), action, data=payload)
         school_url = _find_link(BeautifulSoup(logged_in.text, "lxml"), SCHOOL_LINK, logged_in.url)
