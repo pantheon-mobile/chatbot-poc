@@ -1,4 +1,4 @@
-from jasso_crawler import JassoCrawler, parse_detail, parse_faq_links
+from jasso_crawler import JassoCrawler, parse_detail, parse_faq_json, parse_faq_links
 
 
 LIST_HTML = """
@@ -47,6 +47,23 @@ def test_current_faq_class_detail_parser():
     item = parse_detail(CURRENT_DETAIL_HTML, link.url, link)
     assert item.question == "現在の質問ですか。"
     assert item.answer == "現在の回答です。"
+
+
+def test_faq_json_parser_removes_update_and_duplicates():
+    payload = {
+        "data": [
+            {"title": "質問ですか。（2026年4月更新）", "url": "1216141_2871.html"},
+            {"title": "質問ですか。（2026年4月更新）", "url": "1216141_2871.html"},
+        ]
+    }
+    links = parse_faq_json(
+        payload, "https://www2.jasso.go.jp/daigaku/faq/category/index.html",
+        ("予約採用", "通知"),
+    )
+    assert len(links) == 1
+    assert links[0].question == "質問ですか。"
+    assert links[0].source_updated_year == 2026
+    assert links[0].url.endswith("/category/1216141_2871.html")
 
 
 def test_login_selects_password_form_after_search_form(monkeypatch):

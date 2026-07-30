@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections import deque
@@ -97,6 +98,29 @@ def parse_faq_links(html: str, page_url: str, category_path: tuple[str, ...]) ->
         if url not in seen and question and (looks_like_q or looks_like_detail):
             seen.add(url)
             output.append(FAQLink(url, question, category_path, updated_text, year, month))
+    return output
+
+
+def parse_faq_json(value: str | dict, page_url: str,
+                   category_path: tuple[str, ...]) -> list[FAQLink]:
+    payload = json.loads(value) if isinstance(value, str) else value
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    output = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = normalize_url(str(row.get("url", "")), page_url)
+        displayed = normalize_text(str(row.get("title", "")))
+        if not url or url in seen or not displayed:
+            continue
+        seen.add(url)
+        updated_text, year, month = extract_update(displayed)
+        output.append(FAQLink(
+            url=url, question=strip_update(displayed), category_path=category_path,
+            source_updated_text=updated_text, source_updated_year=year,
+            source_updated_month=month,
+        ))
     return output
 
 
@@ -288,6 +312,22 @@ class JassoCrawler:
                 soup = BeautifulSoup(html, "lxml")
                 path = _heading_category_path(soup, page.category_path)
                 faq_links = parse_faq_links(html, url, path)
+                # Category result lists are populated by faq_bundle.js from a
+                # same-directory JSON endpoint, so requests must fetch it explicitly.
+                if soup.select_one("#faq-result"):
+                    faq_json_url = normalize_url("faq.json", url)
+                    if is_allowed_jasso_url(faq_json_url, root_url):
+                        try:
+                            faq_links.extend(parse_faq_json(
+                                self._get(faq_json_url), url, path
+                            ))
+                        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                            result.errors.append(CrawlError(
+                                faq_json_url, f"FAQ一覧JSONを解析できませんでした: {exc}",
+                                " > ".join(path),
+                            ))
+                # Top-page HTML and faq.json can contain the same detail link.
+                faq_links = list({link.url: link for link in faq_links}.values())
                 faq_url_set = {x.url for x in faq_links}
                 for link in faq_links:
                     if link.url in detail_urls or not is_allowed_jasso_url(link.url, root_url):
