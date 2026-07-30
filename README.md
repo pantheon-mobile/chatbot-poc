@@ -72,6 +72,13 @@ PDFを複数アップロードし、先頭ページのテキストをClaudeで�
 - `source_file_name`
 - `generated_at`
 
+### JASSO Q&A取得
+
+認可されたJASSO担当者向けアカウントでログインし、「よくあるご質問」のカテゴリ、
+ページ送り、Q&A詳細を順番に巡回します。詳細URL由来の固定IDでBedrock投入用TXTと
+metadata.jsonを生成し、前回マニフェストとの新規・更新・変更なし・削除候補の比較も行います。
+アクセスは並列化せず、標準では1リクエストごとに1秒空けます。
+
 ## セットアップ
 
 ### 1. 仮想環境を作成
@@ -98,6 +105,10 @@ aws_secret_access_key = "YOUR_AWS_SECRET_ACCESS_KEY"
 
 [app]
 password = "YOUR_APP_PASSWORD"
+
+[JASSO]
+user_id = "YOUR_AUTHORIZED_JASSO_USER_ID"
+password = "YOUR_JASSO_PASSWORD"
 ```
 
 `.streamlit/secrets.toml` は `.gitignore` に含まれているため、Gitにはコミットされません。
@@ -109,6 +120,37 @@ streamlit run app.py
 ```
 
 起動後、ブラウザでStreamlitアプリを開き、`[app] password` に設定したパスワードでログインします。
+
+### JASSOクロールの実行
+
+1. `.streamlit/secrets.toml.example`を参考に、ローカルのSecretsへ`[JASSO]`を設定します。
+2. `streamlit run app.py`で起動し、「🌐 JASSO Q&A取得」を開きます。
+3. 初回は「全件出力」のまま接続テスト後、クローリングを開始します。
+4. 2回目以降は、前回ダウンロードした`jasso_crawl_manifest.json`をアップロードします。
+5. 必要に応じて「新規・更新分のみ」を選ぶと、ZIPには差分だけが入ります。
+
+ダウンロードできるファイルは、Bedrock投入用ZIP、最新マニフェスト、全件レポート、
+削除候補CSV、エラーログCSVです。ZIPにはTXTと対応するmetadata.jsonだけが入ります。
+
+依存パッケージとテストは次のコマンドで準備・実行できます。
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+Streamlit Community Cloudでは、アプリ設定のSecretsへ`.streamlit/secrets.toml`と同じ
+`[JASSO]`設定を登録してください。`secrets.toml`自体はコミットしません。
+
+#### JASSO取得のトラブルシューティング
+
+- ログイン失敗時はID・パスワードと、ログインフォームの入力名・送信先を確認します。
+- FAQへ到達できない場合は、ログイン後の学校区分リンクと「よくあるご質問」の表示文字列・hrefを確認します。
+- Q/A解析エラー時はデバッグHTML保存を有効にし、`jasso_crawler.py`の`JassoSelectors`、
+  パンくず、Q/A見出し周辺の構造を確認します。保存HTMLにCookieや入力した認証情報は含めません。
+- 429や一時的な5xxでは自動リトライします。繰り返す場合はアクセス間隔を長くしてください。
+- 正規の権限を持つアカウントでのみ利用してください。CAPTCHAや多要素認証が導入された場合、
+  自動回避は行わず運用またはログイン方式を見直してください。
 
 ## AWSで利用するサービス
 

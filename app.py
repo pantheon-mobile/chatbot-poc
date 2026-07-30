@@ -9,6 +9,8 @@ import re
 from datetime import datetime
 from typing import Optional
 from pypdf import PdfReader
+from jasso_crawler import JassoCrawler
+from jasso_exporter import build_outputs
 
 # ==========================================
 #  ダイアログ：フィードバック送信
@@ -690,7 +692,8 @@ page = st.sidebar.radio(
         "💬 チャット検証画面",
         "📊 Excel自動変換ツール",
         "💾 フィードバックCSV出力",
-        "🧾 PDFメタデータ生成"
+        "🧾 PDFメタデータ生成",
+        "🌐 JASSO Q&A取得"
     ]
 )
 
@@ -1398,3 +1401,111 @@ elif page == "🧾 PDFメタデータ生成":
                 file_name=zip_file_name,
                 mime="application/zip"
             )
+
+# ==========================================
+#  メニュー5：JASSO Q&A取得
+# ==========================================
+elif page == "🌐 JASSO Q&A取得":
+    st.title("JASSO Q&A取得")
+    st.write(
+        "JASSO担当者向けサイトへログインし、「よくあるご質問」からQ&Aを取得して"
+        "Bedrock用TXT・metadata.jsonを生成します。"
+    )
+
+    try:
+        jasso_user_id = st.secrets["JASSO"]["user_id"]
+        jasso_password = st.secrets["JASSO"]["password"]
+    except (KeyError, FileNotFoundError):
+        jasso_user_id = ""
+        jasso_password = ""
+
+    col_id, col_password = st.columns(2)
+    col_id.write(f"ID: {'設定済み' if jasso_user_id else '未設定'}")
+    col_password.write(f"パスワード: {'設定済み' if jasso_password else '未設定'}")
+    if not jasso_user_id or not jasso_password:
+        st.error(
+            "Streamlit Secretsに `[JASSO]` の `user_id` と `password` を設定してください。"
+            "実際の値は画面やログに表示されません。"
+        )
+
+    previous_file = st.file_uploader(
+        "前回の jasso_crawl_manifest.json（任意）", type=["json"], key="jasso_manifest"
+    )
+    output_mode = st.radio("出力モード", ["全件出力", "新規・更新分のみ"], horizontal=True)
+    interval = st.number_input("アクセス間隔（秒）", min_value=0.5, value=1.0, step=0.5)
+    debug_mode = st.checkbox("解析失敗ページのHTMLをローカルの debug_jasso_html に保存する")
+
+    previous_manifest = None
+    if previous_file:
+        try:
+            previous_manifest = json.loads(previous_file.getvalue())
+            if not isinstance(previous_manifest.get("items"), dict):
+                raise ValueError("itemsがありません。")
+            st.success(f"前回マニフェストを読み込みました（{len(previous_manifest['items'])}件）。")
+        except (json.JSONDecodeError, ValueError) as exc:
+            st.error(f"前回マニフェストを読み込めません: {exc}")
+
+    def make_jasso_crawler():
+        return JassoCrawler(
+            jasso_user_id, jasso_password, interval=float(interval),
+            debug_dir="debug_jasso_html" if debug_mode else None,
+        )
+
+    if st.button("接続テスト", disabled=not (jasso_user_id and jasso_password)):
+        try:
+            with st.spinner("JASSOへ接続してログイン経路を確認しています..."):
+                faq_url = make_jasso_crawler().connection_test()
+            st.success(f"ログインと「よくあるご質問」への到達を確認しました: {faq_url}")
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.button(
+        "クローリング開始", type="primary",
+        disabled=not (jasso_user_id and jasso_password),
+    ):
+        progress_bar = st.progress(0)
+        category_area = st.empty()
+        url_area = st.empty()
+        count_area = st.empty()
+
+        def update_jasso_progress(info):
+            category_area.info(f"現在処理中のカテゴリ: {info.get('category') or 'カテゴリルート'}")
+            url_area.code(info.get("url", ""))
+            count_area.write(
+                f"取得済みQ&A: {info.get('count', 0)}件 / エラー: {info.get('errors', 0)}件"
+            )
+
+        try:
+            result = make_jasso_crawler().crawl(progress=update_jasso_progress)
+            outputs = build_outputs(
+                result, previous_manifest, diff_only=(output_mode == "新規・更新分のみ")
+            )
+            st.session_state.jasso_outputs = outputs
+            progress_bar.progress(1.0)
+            counts = {"new": 0, "updated": 0, "unchanged": 0}
+            for status in outputs["statuses"].values():
+                counts[status] += 1
+            st.success(f"クローリングが完了しました（取得 {len(result.faqs)}件）。")
+            st.write(
+                f"新規: {counts['new']} / 更新: {counts['updated']} / "
+                f"変更なし: {counts['unchanged']} / エラー: {len(result.errors)} / "
+                f"削除候補: {len(outputs['removed'])}"
+            )
+        except Exception as exc:
+            st.error(str(exc))
+
+    if "jasso_outputs" in st.session_state:
+        outputs = st.session_state.jasso_outputs
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        zip_kind = "diff" if output_mode == "新規・更新分のみ" else "all"
+        st.subheader("ダウンロード")
+        st.download_button("Bedrock投入用ZIP", outputs["zip"],
+                           f"jasso_bedrock_data_{zip_kind}_{stamp}.zip", "application/zip")
+        st.download_button("jasso_crawl_manifest.json", outputs["manifest"],
+                           "jasso_crawl_manifest.json", "application/json")
+        st.download_button("jasso_crawl_report.csv", outputs["report"],
+                           "jasso_crawl_report.csv", "text/csv")
+        st.download_button("deleted_candidates.csv", outputs["deleted"],
+                           "deleted_candidates.csv", "text/csv")
+        st.download_button("エラーログCSV", outputs["errors"],
+                           "jasso_crawl_errors.csv", "text/csv")
