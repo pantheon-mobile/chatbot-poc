@@ -6,9 +6,13 @@ import io
 import zipfile
 import traceback
 import re
+import os
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 from pypdf import PdfReader
+import requests
+from bs4 import BeautifulSoup, NavigableString, Tag
 from jasso_crawler import JassoCrawler
 from jasso_exporter import build_outputs
 
@@ -193,6 +197,216 @@ PDF先頭テキスト:
     attrs["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return metadata, response_text
+
+
+# ==========================================
+#  データ取り込み比較 PoC 共通関数
+# ==========================================
+def sanitize_document_name(name: str, fallback: str = "document") -> str:
+    """ZIP内で安全に使える、拡張子を含まない文書名へ整形する。"""
+    base_name = os.path.splitext(os.path.basename(name or ""))[0]
+    sanitized = re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龠々ー._-]+", "_", base_name)
+    sanitized = sanitized.strip("._-")
+    return (sanitized or fallback)[:120]
+
+
+def create_bedrock_runtime_client():
+    return boto3.client(
+        service_name="bedrock-runtime",
+        region_name="ap-northeast-1",
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+    )
+
+
+def extract_pdf_full_text(pdf_bytes: bytes) -> tuple[str, str]:
+    """全ページをページ境界付きで抽出し、PDFメタデータ等からタイトルも返す。"""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    page_blocks = []
+    extracted_pages = []
+    first_text_line = ""
+    for page_number, page in enumerate(reader.pages, start=1):
+        page_text = (page.extract_text() or "").strip()
+        extracted_pages.append(page_text)
+        if page_text and not first_text_line:
+            first_text_line = next((line.strip() for line in page_text.splitlines() if line.strip()), "")
+        page_blocks.append(f"--- page {page_number} ---\n\n{page_text}")
+
+    full_text = "\n\n".join(page_blocks).strip()
+    if not any(extracted_pages):
+        raise ValueError("PDFからテキストを抽出できませんでした。画像PDFの可能性があります。")
+
+    metadata_title = ""
+    if reader.metadata:
+        metadata_title = str(reader.metadata.get("/Title") or "").strip()
+    return full_text, metadata_title or first_text_line[:200]
+
+
+def convert_pdf_text_to_markdown(pdf_text: str, model_id: str) -> str:
+    """Claude Sonnetで全文を分割処理し、記載内容だけを構造化Markdownへ変換する。"""
+    client = create_bedrock_runtime_client()
+    # ページ境界を優先して分割し、巨大PDFでもモデル入力上限を超えにくくする。
+    pages = re.split(r"(?=--- page \d+ ---)", pdf_text)
+    chunks, current = [], ""
+    for page in pages:
+        if current and len(current) + len(page) > 28000:
+            chunks.append(current)
+            current = page
+        else:
+            current += page
+    if current:
+        chunks.append(current)
+
+    markdown_parts = []
+    for index, chunk in enumerate(chunks, start=1):
+        prompt = f"""
+次のPDF抽出テキストを、RAG検索で意味構造が残るMarkdownに変換してください。
+文書タイトル、見出し、小見出し、箇条書き、表、注意事項、条件、対象者、金額、期間、
+必要書類を、原文で判別できる範囲だけ構造化してください。
+
+厳守事項:
+- 原文にない内容を追加、補完、推測、要約しない
+- 数字、固有名詞、条件を改変しない
+- 読み取れない表を創作しない
+- ページ境界は `<!-- page N -->` として残す
+- Markdown本文のみを返し、コードフェンスや前置きを付けない
+- この入力は全{len(chunks)}分割中の{index}番目です
+
+PDF抽出テキスト:
+{chunk}
+"""
+        response = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 8000, "temperature": 0}
+        )
+        part = response["output"]["message"]["content"][0]["text"].strip()
+        part = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", part, flags=re.IGNORECASE)
+        markdown_parts.append(part)
+    return "\n\n".join(markdown_parts).strip()
+
+
+def build_ingestion_metadata(source_type: str, ingestion_format: str, ui_metadata: dict,
+                             source_url: str, source_file_name: str, original_title: str) -> dict:
+    return {
+        "metadataAttributes": {
+            "source_type": source_type,
+            "ingestion_format": ingestion_format,
+            "type1": ui_metadata.get("type1", ""),
+            "type2": ui_metadata.get("type2", ""),
+            "type3": ui_metadata.get("type3", ""),
+            "category": ui_metadata.get("category", ""),
+            "answer_source": ui_metadata.get("answer_source", "enabled"),
+            "priority": ui_metadata.get("priority", "medium"),
+            "source_url": source_url or "",
+            "source_file_name": source_file_name,
+            "original_title": original_title or "",
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    }
+
+
+WEB_NOISE_SELECTORS = [
+    "header", "footer", "nav", "menu", "aside", "script", "style", "form", "iframe",
+    "[role='navigation']", "[role='banner']", "[role='contentinfo']", "[aria-label*='breadcrumb' i]",
+    ".breadcrumb", ".breadcrumbs", ".cookie", ".cookie-banner", ".sidebar", ".side-bar",
+    ".advertisement", ".ads", ".social", ".share", "#cookie", "#sidebar"
+]
+
+
+def _table_to_markdown(table: Tag) -> str:
+    rows = []
+    for tr in table.find_all("tr"):
+        cells = [cell.get_text(" ", strip=True).replace("|", "\\|") for cell in tr.find_all(["th", "td"])]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    return "\n".join([
+        "| " + " | ".join(rows[0]) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+        *("| " + " | ".join(row) + " |" for row in rows[1:])
+    ])
+
+
+def _element_to_markdown(element: Tag, base_url: str) -> str:
+    name = element.name.lower()
+    if re.fullmatch(r"h[1-6]", name):
+        return f"{'#' * int(name[1])} {element.get_text(' ', strip=True)}"
+    if name == "p":
+        pieces = []
+        for child in element.descendants:
+            if isinstance(child, NavigableString) and child.parent.name not in {"script", "style"}:
+                text = str(child)
+                if child.parent.name == "a" and child.parent.get("href"):
+                    if child is next(iter(child.parent.children), None):
+                        pieces.append(f"[{child.parent.get_text(' ', strip=True)}]({urljoin(base_url, child.parent['href'])})")
+                elif child.find_parent("a") is None:
+                    pieces.append(text)
+        return re.sub(r"\s+", " ", "".join(pieces)).strip()
+    if name in {"ul", "ol"}:
+        lines = []
+        for index, li in enumerate(element.find_all("li", recursive=False), start=1):
+            prefix = f"{index}." if name == "ol" else "-"
+            lines.append(f"{prefix} {li.get_text(' ', strip=True)}")
+        return "\n".join(lines)
+    if name == "table":
+        return _table_to_markdown(element)
+    return ""
+
+
+def fetch_and_extract_web_page(url: str, timeout: int = 20) -> tuple[str, str, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("http または https の有効なURLを入力してください。")
+    try:
+        response = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 IngestionPoC/1.0"})
+    except requests.Timeout as exc:
+        raise ValueError(f"Webページ取得がタイムアウトしました（{timeout}秒）。") from exc
+    except requests.RequestException as exc:
+        raise ValueError(f"Webページを取得できませんでした: {exc}") from exc
+    if response.status_code == 403:
+        raise ValueError("Webページの取得が拒否されました（HTTP 403）。")
+    if response.status_code == 404:
+        raise ValueError("Webページが見つかりません（HTTP 404）。")
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise ValueError(f"Webページ取得エラー（HTTP {response.status_code}）。") from exc
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" not in content_type:
+        raise ValueError(f"HTMLではないレスポンスです（Content-Type: {content_type or '不明'}）。")
+
+    response.encoding = response.apparent_encoding or response.encoding
+    soup = BeautifulSoup(response.text, "lxml")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    for selector in WEB_NOISE_SELECTORS:
+        for node in soup.select(selector):
+            node.decompose()
+    root = soup.find("main") or soup.find("article") or soup.body
+    if not root:
+        raise ValueError("HTMLから本文領域を特定できませんでした。")
+    h1 = root.find("h1")
+    original_title = title or (h1.get_text(" ", strip=True) if h1 else "")
+    plain_text = root.get_text("\n", strip=True)
+    if len(plain_text) < 20:
+        raise ValueError("Webページから本文を抽出できませんでした。")
+
+    blocks = []
+    if original_title:
+        blocks.append(f"# {original_title}")
+    blocks.append(f"元URL: {url}")
+    for element in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "table"]):
+        if element.find_parent(["ul", "ol", "table"]):
+            continue
+        block = _element_to_markdown(element, url)
+        if block:
+            blocks.append(block)
+    markdown = "\n\n".join(blocks).strip()
+    text = f"元URL: {url}\n\n{plain_text}"
+    return text, markdown, original_title
 
 
 # ==========================================
@@ -693,6 +907,7 @@ page = st.sidebar.radio(
         "📊 Excel自動変換ツール",
         "💾 フィードバックCSV出力",
         "🧾 PDFメタデータ生成",
+        "🧪 データ取り込み検証",
         "🌐 JASSO Q&A取得"
     ]
 )
@@ -1403,7 +1618,219 @@ elif page == "🧾 PDFメタデータ生成":
             )
 
 # ==========================================
-#  メニュー5：JASSO Q&A取得
+#  メニュー5：データ取り込み方式の比較検証
+# ==========================================
+elif page == "🧪 データ取り込み検証":
+    st.title("🧪 データ取り込み検証")
+    st.write("PDF原本・TXT・Markdown、またはWeb本文のTXT・Markdownを生成し、投入形式を比較します。")
+    st.caption("生成物はZIPでダウンロードします。S3へのアップロードやKnowledge Base同期は行いません。")
+
+    st.subheader("共通metadata")
+    meta_col1, meta_col2 = st.columns(2)
+    with meta_col1:
+        ingestion_type1 = st.text_input("種別1", key="ingestion_type1")
+        ingestion_type2 = st.text_input("種別2", key="ingestion_type2")
+        ingestion_type3 = st.text_input("種別3", key="ingestion_type3")
+        ingestion_category = st.text_input("カテゴリ", key="ingestion_category")
+    with meta_col2:
+        ingestion_answer_source = st.radio(
+            "回答ソース", ["enabled", "disabled"], horizontal=True, key="ingestion_answer_source"
+        )
+        ingestion_priority = st.radio(
+            "優先度", ["high", "medium", "low"], index=1, horizontal=True,
+            key="ingestion_priority"
+        )
+    ingestion_ui_metadata = {
+        "type1": ingestion_type1,
+        "type2": ingestion_type2,
+        "type3": ingestion_type3,
+        "category": ingestion_category,
+        "answer_source": ingestion_answer_source,
+        "priority": ingestion_priority
+    }
+
+    pdf_tab, web_tab = st.tabs(["PDF取り込み比較", "Webページ取り込み"])
+
+    with pdf_tab:
+        st.subheader("PDF取り込み比較")
+        pdf_uploads = st.file_uploader(
+            "PDFファイル（複数選択可）", type=["pdf"], accept_multiple_files=True,
+            key="ingestion_pdf_uploads"
+        )
+        format_col1, format_col2, format_col3 = st.columns(3)
+        include_pdf = format_col1.checkbox("PDF原本", value=True, key="include_original_pdf")
+        include_txt = format_col2.checkbox("TXT", value=True, key="include_pdf_txt")
+        include_markdown = format_col3.checkbox("Markdown（Claude Sonnet）", value=True, key="include_pdf_md")
+        pdf_source_url = st.text_input("元URL（任意）", key="ingestion_pdf_source_url")
+        markdown_model_id = st.text_input(
+            "Markdown整形モデルID", value=CHAT_MODEL_ID, key="ingestion_markdown_model"
+        )
+
+        if pdf_uploads:
+            st.dataframe(pd.DataFrame([
+                {"ファイル名": item.name, "サイズ(KB)": round(len(item.getvalue()) / 1024, 1)}
+                for item in pdf_uploads
+            ]), use_container_width=True)
+
+        if st.button("PDF変換を実行", type="primary", key="run_pdf_ingestion"):
+            if not pdf_uploads:
+                st.error("PDFファイルを1件以上アップロードしてください。")
+            elif not any([include_pdf, include_txt, include_markdown]):
+                st.error("生成形式を1つ以上選択してください。")
+            else:
+                zip_buffer = io.BytesIO()
+                results = []
+                previews = []
+                progress = st.progress(0)
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                    for pdf_index, uploaded_pdf in enumerate(pdf_uploads, start=1):
+                        original_name = uploaded_pdf.name
+                        safe_name = sanitize_document_name(original_name)
+                        pdf_bytes = uploaded_pdf.getvalue()
+                        pdf_text, original_title, extraction_error = "", "", None
+                        if include_txt or include_markdown:
+                            try:
+                                pdf_text, original_title = extract_pdf_full_text(pdf_bytes)
+                            except Exception as exc:
+                                extraction_error = str(exc)
+
+                        selected_formats = []
+                        if include_pdf:
+                            selected_formats.append(("pdf", f"pdf/{safe_name}.pdf", pdf_bytes, None))
+                        if include_txt:
+                            selected_formats.append(("txt", f"txt/{safe_name}.txt", pdf_text, extraction_error))
+                        if include_markdown:
+                            if extraction_error:
+                                selected_formats.append(("markdown", f"markdown/{safe_name}.md", "", extraction_error))
+                            else:
+                                try:
+                                    markdown_text = convert_pdf_text_to_markdown(pdf_text, markdown_model_id)
+                                    selected_formats.append(("markdown", f"markdown/{safe_name}.md", markdown_text, None))
+                                except Exception as exc:
+                                    selected_formats.append(("markdown", f"markdown/{safe_name}.md", "", str(exc)))
+
+                        for format_name, archive_name, content, error in selected_formats:
+                            if error:
+                                results.append({
+                                    "元ファイル名 / URL": original_name, "生成形式": format_name,
+                                    "文字数": 0, "結果": "エラー", "エラー内容": error
+                                })
+                                continue
+                            metadata = build_ingestion_metadata(
+                                "pdf", format_name, ingestion_ui_metadata, pdf_source_url,
+                                original_name, original_title
+                            )
+                            output_zip.writestr(archive_name, content)
+                            output_zip.writestr(
+                                f"{archive_name}.metadata.json",
+                                json.dumps(metadata, ensure_ascii=False, indent=2)
+                            )
+                            # PDFはバイナリなので、比較表示では抽出可能な本文の文字数を使う。
+                            char_count = len(content) if isinstance(content, str) else len(pdf_text)
+                            results.append({
+                                "元ファイル名 / URL": original_name, "生成形式": format_name,
+                                "文字数": char_count, "結果": "成功", "エラー内容": ""
+                            })
+                            previews.append({
+                                "source": original_name, "format": format_name, "count": char_count,
+                                "metadata": metadata, "text": content[:5000] if isinstance(content, str) else ""
+                            })
+                        progress.progress(pdf_index / len(pdf_uploads))
+                st.session_state.ingestion_pdf_output = {
+                    "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+                    "filename": datetime.now().strftime("ingestion_test_%Y%m%d%H%M%S.zip")
+                }
+
+        if "ingestion_pdf_output" in st.session_state:
+            pdf_output = st.session_state.ingestion_pdf_output
+            st.subheader("PDF処理結果")
+            st.dataframe(pd.DataFrame(pdf_output["results"]), use_container_width=True)
+            for preview in pdf_output["previews"]:
+                with st.expander(f"✅ {preview['source']} / {preview['format']} / {preview['count']}文字"):
+                    st.json(preview["metadata"])
+                    if preview["text"]:
+                        if preview["format"] == "markdown":
+                            st.markdown(preview["text"])
+                        else:
+                            st.text(preview["text"])
+            st.download_button(
+                "PDF比較ZIPをダウンロード", pdf_output["zip"], pdf_output["filename"],
+                "application/zip", key="download_pdf_ingestion"
+            )
+
+    with web_tab:
+        st.subheader("Webページ取り込み")
+        web_url = st.text_input("URL（1件）", placeholder="https://example.com/page", key="ingestion_web_url")
+        web_format_col1, web_format_col2 = st.columns(2)
+        include_web_txt = web_format_col1.checkbox("TXT", value=True, key="include_web_txt")
+        include_web_markdown = web_format_col2.checkbox("Markdown", value=True, key="include_web_md")
+
+        if st.button("Webページ変換を実行", type="primary", key="run_web_ingestion"):
+            if not web_url.strip():
+                st.error("URLを入力してください。")
+            elif not any([include_web_txt, include_web_markdown]):
+                st.error("生成形式を1つ以上選択してください。")
+            else:
+                results, previews = [], []
+                zip_buffer = io.BytesIO()
+                try:
+                    web_text, web_markdown, web_title = fetch_and_extract_web_page(web_url.strip())
+                    fallback_name = urlparse(web_url).path.rstrip("/").split("/")[-1] or "index"
+                    safe_name = sanitize_document_name(web_title or fallback_name, fallback="web_page")
+                    formats = []
+                    if include_web_txt:
+                        formats.append(("txt", f"web_txt/{safe_name}.txt", web_text))
+                    if include_web_markdown:
+                        formats.append(("markdown", f"web_markdown/{safe_name}.md", web_markdown))
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                        for format_name, archive_name, content in formats:
+                            generated_name = archive_name.rsplit("/", 1)[-1]
+                            metadata = build_ingestion_metadata(
+                                "web", format_name, ingestion_ui_metadata, web_url.strip(),
+                                generated_name, web_title
+                            )
+                            output_zip.writestr(archive_name, content)
+                            output_zip.writestr(
+                                f"{archive_name}.metadata.json",
+                                json.dumps(metadata, ensure_ascii=False, indent=2)
+                            )
+                            results.append({
+                                "元ファイル名 / URL": web_url.strip(), "生成形式": format_name,
+                                "文字数": len(content), "結果": "成功", "エラー内容": ""
+                            })
+                            previews.append({
+                                "source": web_url.strip(), "format": format_name, "count": len(content),
+                                "metadata": metadata, "text": content[:5000]
+                            })
+                except Exception as exc:
+                    results.append({
+                        "元ファイル名 / URL": web_url.strip(), "生成形式": "web",
+                        "文字数": 0, "結果": "エラー", "エラー内容": str(exc)
+                    })
+                st.session_state.ingestion_web_output = {
+                    "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+                    "filename": datetime.now().strftime("web_ingestion_test_%Y%m%d%H%M%S.zip")
+                }
+
+        if "ingestion_web_output" in st.session_state:
+            web_output = st.session_state.ingestion_web_output
+            st.subheader("Web処理結果")
+            st.dataframe(pd.DataFrame(web_output["results"]), use_container_width=True)
+            for preview in web_output["previews"]:
+                with st.expander(f"✅ {preview['source']} / {preview['format']} / {preview['count']}文字"):
+                    st.json(preview["metadata"])
+                    if preview["format"] == "markdown":
+                        st.markdown(preview["text"])
+                    else:
+                        st.text(preview["text"])
+            if web_output["zip"]:
+                st.download_button(
+                    "Web変換ZIPをダウンロード", web_output["zip"], web_output["filename"],
+                    "application/zip", key="download_web_ingestion"
+                )
+
+# ==========================================
+#  メニュー6：JASSO Q&A取得
 # ==========================================
 elif page == "🌐 JASSO Q&A取得":
     st.title("JASSO Q&A取得")
