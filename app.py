@@ -7,6 +7,8 @@ import zipfile
 import traceback
 import re
 import os
+import time
+import uuid
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -219,6 +221,340 @@ def create_bedrock_runtime_client():
     )
 
 
+def create_aws_client(service_name: str):
+    """PoCで共通利用している認証情報でAWSクライアントを生成する。"""
+    return boto3.client(
+        service_name=service_name,
+        region_name="ap-northeast-1",
+        aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+    )
+
+
+INGESTION_TEST_KB_PREFIXES = {
+    "FILE_PDF": "documents/ingestion-test/kb-source/file-pdf/",
+    "FILE_TXT": "documents/ingestion-test/kb-source/file-txt/",
+    "FILE_MARKDOWN": "documents/ingestion-test/kb-source/file-markdown/",
+    "WEB_TXT": "documents/ingestion-test/kb-source/web-txt/",
+    "WEB_MARKDOWN": "documents/ingestion-test/kb-source/web-markdown/",
+}
+INGESTION_FILE_FORMATS = ("FILE_PDF", "FILE_TXT", "FILE_MARKDOWN")
+INGESTION_WEB_FORMATS = ("WEB_TXT", "WEB_MARKDOWN")
+INGESTION_SYNC_SUCCESS_STATUSES = {"COMPLETE"}
+INGESTION_SYNC_FAILURE_STATUSES = {"FAILED", "STOPPED"}
+INGESTION_MANUAL_REVIEW_COLUMNS = [
+    "table_preservation", "heading_structure", "reading_order", "chunk_quality",
+    "required_information_present", "irrelevant_source_retrieved", "answer_accuracy",
+    "answer_completeness", "unsupported_information", "citation_accuracy", "review_comment"
+]
+
+
+def generate_datasource_id() -> str:
+    return f"DS_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+
+def _setting(section: str, key: str, default: str = "") -> str:
+    """未設定のStreamlit Secretsを例外にせず画面の初期値として読む。"""
+    try:
+        return str(st.secrets.get(section, {}).get(key, default))
+    except Exception:
+        return default
+
+
+def validate_ingestion_test_config(bucket: str, config: dict) -> list[str]:
+    errors = []
+    if not bucket.strip():
+        errors.append("S3バケット名が未設定です。")
+    kb_ids = []
+    for format_name, values in config.items():
+        kb_id = values.get("knowledge_base_id", "").strip()
+        data_source_id = values.get("data_source_id", "").strip()
+        if not kb_id or kb_id.startswith("KB_ID_"):
+            errors.append(f"{format_name}のKnowledge Base IDが未設定です。")
+        if not data_source_id or data_source_id.startswith("DATA_SOURCE_ID_"):
+            errors.append(f"{format_name}のData Source IDが未設定です。")
+        kb_ids.append(kb_id)
+    if len([item for item in kb_ids if item]) != len(set(item for item in kb_ids if item)):
+        errors.append("5方式にはそれぞれ別のKnowledge Base IDを指定してください。")
+    return errors
+
+
+def build_ingestion_s3_artifacts(datasource_id: str, source_type: str, formats: dict,
+                                 metadata_by_format: dict, original_bytes: bytes = b"") -> list[dict]:
+    """管理用正本とKB同期専用コピーのS3オブジェクト一覧を生成する。"""
+    root = f"documents/ingestion-test/datasource/{datasource_id}/"
+    artifacts = []
+    if source_type == "pdf" and original_bytes:
+        artifacts.extend([{
+            "datasource_id": datasource_id, "format": "ORIGINAL", "role": "管理用正本",
+            "key": f"{root}original/source.pdf", "body": original_bytes, "content_type": "application/pdf"
+        }, {
+            "datasource_id": datasource_id, "format": "ORIGINAL", "role": "管理用正本",
+            "key": f"{root}original/source.pdf.metadata.json",
+            "body": json.dumps(metadata_by_format["FILE_PDF"], ensure_ascii=False, indent=2).encode("utf-8"),
+            "content_type": "application/json"
+        }])
+    layout = {
+        "FILE_PDF": ("pdf", "source.pdf", "application/pdf"),
+        "FILE_TXT": ("txt", "source.txt", "text/plain; charset=utf-8"),
+        "FILE_MARKDOWN": ("markdown", "source.md", "text/markdown; charset=utf-8"),
+        "WEB_TXT": ("web-txt", "page.txt", "text/plain; charset=utf-8"),
+        "WEB_MARKDOWN": ("web-markdown", "page.md", "text/markdown; charset=utf-8"),
+    }
+    for format_name, content in formats.items():
+        folder, file_name, content_type = layout[format_name]
+        metadata_bytes = json.dumps(
+            metadata_by_format[format_name], ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        body = content if isinstance(content, bytes) else content.encode("utf-8")
+        canonical_key = f"{root}processed/{folder}/{file_name}"
+        kb_key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{datasource_id}/{file_name}"
+        for role, key in [("管理用正本", canonical_key), ("KB同期用コピー", kb_key)]:
+            artifacts.extend([
+                {"datasource_id": datasource_id, "format": format_name, "role": role,
+                 "key": key, "body": body, "content_type": content_type},
+                {"datasource_id": datasource_id, "format": format_name, "role": role,
+                 "key": f"{key}.metadata.json", "body": metadata_bytes,
+                 "content_type": "application/json"}
+            ])
+    return artifacts
+
+
+def upload_ingestion_artifacts_to_s3(artifacts: list[dict], bucket: str,
+                                     source_label: str = "") -> list[dict]:
+    """許可済み検証prefixの成果物を既存オブジェクトへ上書きせずアップロードする。"""
+    s3 = create_aws_client("s3")
+    rows = []
+    allowed_root = "documents/ingestion-test/"
+    for artifact in artifacts:
+        started = time.perf_counter()
+        s3_key = artifact["key"]
+        row = {
+            "datasource_id": artifact["datasource_id"], "元データ": source_label,
+            "形式": artifact["format"], "配置区分": artifact["role"],
+            "S3 Key": s3_key, "アップロード結果": "失敗", "所要時間(ms)": 0,
+            "エラー内容": ""
+        }
+        try:
+            if not s3_key.startswith(allowed_root) or ".." in s3_key.split("/"):
+                raise ValueError("許可された検証prefix外のS3 Keyです。")
+            try:
+                s3.head_object(Bucket=bucket, Key=s3_key)
+                raise FileExistsError("同名のS3オブジェクトが既に存在するため上書きしません。")
+            except s3.exceptions.ClientError as exc:
+                if str(exc.response.get("Error", {}).get("Code")) not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
+            s3.put_object(
+                Bucket=bucket, Key=s3_key, Body=artifact["body"],
+                ContentType=artifact["content_type"], IfNoneMatch="*"
+            )
+            row["アップロード結果"] = "成功"
+        except Exception as exc:
+            row["エラー内容"] = str(exc)
+        row["所要時間(ms)"] = round((time.perf_counter() - started) * 1000, 1)
+        rows.append(row)
+    return rows
+
+
+def run_ingestion_sync(config: dict, timeout_seconds: int, status_callback=None) -> list[dict]:
+    """3つのData Sourceの同期を開始し、個別に終端状態まで監視する。"""
+    client = create_aws_client("bedrock-agent")
+    jobs = {}
+    results = []
+    for format_name, values in config.items():
+        started_at = datetime.now()
+        try:
+            response = client.start_ingestion_job(
+                knowledgeBaseId=values["knowledge_base_id"], dataSourceId=values["data_source_id"]
+            )
+            jobs[format_name] = {
+                **values, "job_id": response["ingestionJob"]["ingestionJobId"],
+                "started_at": started_at, "status": response["ingestionJob"].get("status", "STARTING")
+            }
+        except Exception as exc:
+            results.append({
+                "形式": format_name, "開始時刻": started_at, "終了時刻": datetime.now(),
+                "所要時間(秒)": 0, "ステータス": "FAILED", "失敗理由": str(exc)
+            })
+
+    deadline = time.monotonic() + timeout_seconds
+    while jobs and time.monotonic() < deadline:
+        for format_name in list(jobs):
+            job = jobs[format_name]
+            try:
+                response = client.get_ingestion_job(
+                    knowledgeBaseId=job["knowledge_base_id"], dataSourceId=job["data_source_id"],
+                    ingestionJobId=job["job_id"]
+                )["ingestionJob"]
+                job["status"] = response.get("status", "UNKNOWN")
+                if status_callback:
+                    status_callback(format_name, job["status"])
+                if job["status"] in INGESTION_SYNC_SUCCESS_STATUSES | INGESTION_SYNC_FAILURE_STATUSES:
+                    ended_at = datetime.now()
+                    reasons = response.get("failureReasons", [])
+                    results.append({
+                        "形式": format_name, "開始時刻": job["started_at"], "終了時刻": ended_at,
+                        "所要時間(秒)": round((ended_at - job["started_at"]).total_seconds(), 1),
+                        "ステータス": job["status"], "失敗理由": " / ".join(reasons)
+                    })
+                    del jobs[format_name]
+            except Exception as exc:
+                ended_at = datetime.now()
+                results.append({
+                    "形式": format_name, "開始時刻": job["started_at"], "終了時刻": ended_at,
+                    "所要時間(秒)": round((ended_at - job["started_at"]).total_seconds(), 1),
+                    "ステータス": "FAILED", "失敗理由": str(exc)
+                })
+                del jobs[format_name]
+        if jobs:
+            time.sleep(3)
+    for format_name, job in jobs.items():
+        ended_at = datetime.now()
+        results.append({
+            "形式": format_name, "開始時刻": job["started_at"], "終了時刻": ended_at,
+            "所要時間(秒)": round((ended_at - job["started_at"]).total_seconds(), 1),
+            "ステータス": "TIMEOUT", "失敗理由": f"{timeout_seconds}秒でタイムアウトしました。"
+        })
+    return results
+
+
+INGESTION_ANSWER_PROMPT = """あなたは大学の奨学金業務のベテラン職員です。
+提供された検索結果（マニュアルや規程の資料）を最優先の根拠として回答してください。
+資料に記載されていない内容は推測してはいけません。具体的な書類名、条件、提出先は省略せず、
+複数ある場合は対応関係が分かるように列挙してください。情報がない項目はその旨を明記してください。
+
+検索結果:
+{context}
+
+質問: {question}
+"""
+
+
+def _retrieval_source(result: dict) -> tuple[str, str, str]:
+    location = result.get("location", {})
+    source_uri = ""
+    for value in location.values():
+        if isinstance(value, dict):
+            source_uri = value.get("uri") or value.get("url") or source_uri
+    metadata = result.get("metadata", {})
+    source_uri = source_uri or str(metadata.get("x-amz-bedrock-kb-source-uri", ""))
+    uri_file = os.path.basename(urlparse(source_uri).path)
+    source_file = str(metadata.get("source_file_name", "")).strip() or uri_file
+    match_file = str(metadata.get("original_source_file_name", "")).strip() or source_file
+    return source_uri, source_file, match_file
+
+
+def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_type: str,
+                                 top_k: int, model_id: str, max_tokens: int,
+                                 progress_callback=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    agent_runtime = create_aws_client("bedrock-agent-runtime")
+    runtime = create_bedrock_runtime_client()
+    detail_rows, comparison_rows = [], []
+    total = max(len(questions) * len(config), 1)
+    completed = 0
+    for _, question_row in questions.iterrows():
+        question = str(question_row.get("question", "")).strip()
+        expected_source = str(question_row.get("expected_source", "") or "").strip()
+        expected_answer = str(question_row.get("expected_answer", "") or "").strip()
+        keywords = [item.strip() for item in str(question_row.get("expected_keywords", "") or "").split(",") if item.strip()]
+        for format_name, values in config.items():
+            total_started = time.perf_counter()
+            retrieval_started = time.perf_counter()
+            response = agent_runtime.retrieve(
+                knowledgeBaseId=values["knowledge_base_id"], retrievalQuery={"text": question},
+                retrievalConfiguration={"vectorSearchConfiguration": {
+                    "numberOfResults": top_k, "overrideSearchType": search_type
+                }}
+            )
+            retrieval_ms = round((time.perf_counter() - retrieval_started) * 1000, 1)
+            retrieved = response.get("retrievalResults", [])
+            combined_text = "\n\n".join(item.get("content", {}).get("text", "") for item in retrieved)
+            source_hit_rank = None
+            top_score = None
+            retrieved_datasource_id = ""
+            citations = []
+            for rank, item in enumerate(retrieved, start=1):
+                source_uri, source_file, match_file = _retrieval_source(item)
+                item_metadata = item.get("metadata", {})
+                if not retrieved_datasource_id:
+                    retrieved_datasource_id = str(item_metadata.get("datasource_id", ""))
+                text_value = item.get("content", {}).get("text", "")
+                if expected_source and expected_source.lower() in match_file.lower() and source_hit_rank is None:
+                    source_hit_rank = rank
+                if rank == 1:
+                    top_score = item.get("score")
+                citations.append(source_uri)
+                detail_rows.append({
+                    "question": question, "ingestion_format": format_name,
+                    "datasource_id": str(item_metadata.get("datasource_id", "")),
+                    "knowledge_base_id": values["knowledge_base_id"], "search_type": search_type,
+                    "top_k": top_k, "rank": rank, "retrieval_score": item.get("score"),
+                    "retrieved_text": text_value, "source_uri": source_uri,
+                    "source_file_name": source_file,
+                    "metadata": json.dumps(item.get("metadata", {}), ensure_ascii=False),
+                    "retrieval_elapsed_ms": retrieval_ms
+                })
+            keyword_hits = sum(1 for keyword in keywords if keyword.lower() in combined_text.lower())
+            generation_started = time.perf_counter()
+            generated = runtime.converse(
+                modelId=model_id,
+                messages=[{"role": "user", "content": [{"text": INGESTION_ANSWER_PROMPT.format(
+                    context=combined_text, question=question
+                )}]}],
+                inferenceConfig={"maxTokens": max_tokens, "temperature": 0}
+            )
+            generation_ms = round((time.perf_counter() - generation_started) * 1000, 1)
+            answer = generated["output"]["message"]["content"][0]["text"]
+            comparison_rows.append({
+                "question": question, "ingestion_format": format_name,
+                "datasource_id": retrieved_datasource_id,
+                "source_hit": bool(source_hit_rank) if expected_source else None,
+                "correct_chunk_rank": source_hit_rank, "top_retrieval_score": top_score,
+                "keyword_hit_count": keyword_hits,
+                "keyword_hit_rate": keyword_hits / len(keywords) if keywords else None,
+                "answer": answer, "retrieval_elapsed_ms": retrieval_ms,
+                "generation_elapsed_ms": generation_ms,
+                "total_elapsed_ms": round((time.perf_counter() - total_started) * 1000, 1),
+                "citation_source": " | ".join(dict.fromkeys(item for item in citations if item)),
+                "expected_source": expected_source,
+                "expected_keywords": ",".join(keywords), "expected_answer": expected_answer,
+                "memo": str(question_row.get("memo", "") or ""),
+                **{column: "" for column in INGESTION_MANUAL_REVIEW_COLUMNS}
+            })
+            completed += 1
+            if progress_callback:
+                progress_callback(completed / total)
+    return pd.DataFrame(detail_rows), pd.DataFrame(comparison_rows)
+
+
+def build_ingestion_format_summary(comparison: pd.DataFrame) -> pd.DataFrame:
+    return comparison.groupby("ingestion_format", as_index=False).agg(
+        source_hit_rate=("source_hit", "mean"),
+        average_top_score=("top_retrieval_score", "mean"),
+        average_keyword_hit_rate=("keyword_hit_rate", "mean"),
+        average_retrieval_ms=("retrieval_elapsed_ms", "mean"),
+        average_generation_ms=("generation_elapsed_ms", "mean")
+    )
+
+
+def build_conversion_summary(results: list[dict]) -> pd.DataFrame:
+    """元データ単位の変換成否と平均変換時間を集計する。"""
+    if not results:
+        return pd.DataFrame()
+    frame = pd.DataFrame(results)
+    unit = frame.groupby("datasource_id", as_index=False).agg(
+        success=("結果", lambda values: all(value == "成功" for value in values)),
+        conversion_ms=("変換時間(ms)", "max")
+    )
+    count = len(unit)
+    successes = int(unit["success"].sum())
+    return pd.DataFrame([{
+        "処理件数": count, "成功件数": successes, "失敗件数": count - successes,
+        "失敗率": (count - successes) / count if count else 0,
+        "平均変換時間(ms)": round(unit["conversion_ms"].mean(), 1) if count else 0
+    }])
+
+
 def extract_pdf_full_text(pdf_bytes: bytes) -> tuple[str, str]:
     """全ページをページ境界付きで抽出し、PDFメタデータ等からタイトルも返す。"""
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -287,9 +623,11 @@ PDF抽出テキスト:
 
 
 def build_ingestion_metadata(source_type: str, ingestion_format: str, ui_metadata: dict,
-                             source_url: str, source_file_name: str, original_title: str) -> dict:
+                             source_url: str, source_file_name: str, original_title: str,
+                             datasource_id: str, original_source_file_name: str = "") -> dict:
     return {
         "metadataAttributes": {
+            "datasource_id": datasource_id,
             "source_type": source_type,
             "ingestion_format": ingestion_format,
             "type1": ui_metadata.get("type1", ""),
@@ -300,6 +638,7 @@ def build_ingestion_metadata(source_type: str, ingestion_format: str, ui_metadat
             "priority": ui_metadata.get("priority", "medium"),
             "source_url": source_url or "",
             "source_file_name": source_file_name,
+            "original_source_file_name": original_source_file_name or source_file_name,
             "original_title": original_title or "",
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -357,11 +696,13 @@ def _element_to_markdown(element: Tag, base_url: str) -> str:
     return ""
 
 
-def fetch_and_extract_web_page(url: str, timeout: int = 20) -> tuple[str, str, str]:
+def fetch_and_extract_web_page(url: str, timeout: int = 20) -> tuple[str, str, str, dict]:
+    total_started = time.perf_counter()
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("http または https の有効なURLを入力してください。")
     try:
+        http_started = time.perf_counter()
         response = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 IngestionPoC/1.0"})
     except requests.Timeout as exc:
         raise ValueError(f"Webページ取得がタイムアウトしました（{timeout}秒）。") from exc
@@ -379,6 +720,8 @@ def fetch_and_extract_web_page(url: str, timeout: int = 20) -> tuple[str, str, s
     if "html" not in content_type:
         raise ValueError(f"HTMLではないレスポンスです（Content-Type: {content_type or '不明'}）。")
 
+    http_ms = round((time.perf_counter() - http_started) * 1000, 1)
+    extraction_started = time.perf_counter()
     response.encoding = response.apparent_encoding or response.encoding
     soup = BeautifulSoup(response.text, "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -393,7 +736,9 @@ def fetch_and_extract_web_page(url: str, timeout: int = 20) -> tuple[str, str, s
     plain_text = root.get_text("\n", strip=True)
     if len(plain_text) < 20:
         raise ValueError("Webページから本文を抽出できませんでした。")
+    extraction_ms = round((time.perf_counter() - extraction_started) * 1000, 1)
 
+    markdown_started = time.perf_counter()
     blocks = []
     if original_title:
         blocks.append(f"# {original_title}")
@@ -405,8 +750,15 @@ def fetch_and_extract_web_page(url: str, timeout: int = 20) -> tuple[str, str, s
         if block:
             blocks.append(block)
     markdown = "\n\n".join(blocks).strip()
+    markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
+    txt_started = time.perf_counter()
     text = f"元URL: {url}\n\n{plain_text}"
-    return text, markdown, original_title
+    txt_ms = round((time.perf_counter() - txt_started) * 1000, 1)
+    return text, markdown, original_title, {
+        "http_fetch_ms": http_ms, "body_extraction_ms": extraction_ms,
+        "txt_generation_ms": txt_ms, "markdown_generation_ms": markdown_ms,
+        "total_conversion_ms": round((time.perf_counter() - total_started) * 1000, 1)
+    }
 
 
 # ==========================================
@@ -1623,7 +1975,7 @@ elif page == "🧾 PDFメタデータ生成":
 elif page == "🧪 データ取り込み検証":
     st.title("🧪 データ取り込み検証")
     st.write("PDF原本・TXT・Markdown、またはWeb本文のTXT・Markdownを生成し、投入形式を比較します。")
-    st.caption("生成物はZIPでダウンロードします。S3へのアップロードやKnowledge Base同期は行いません。")
+    st.caption("生成後、検証専用prefixへのS3配置・3つの検証専用Knowledge Base同期・同条件評価まで実行できます。")
 
     st.subheader("共通metadata")
     meta_col1, meta_col2 = st.columns(2)
@@ -1678,48 +2030,55 @@ elif page == "🧪 データ取り込み検証":
             elif not any([include_pdf, include_txt, include_markdown]):
                 st.error("生成形式を1つ以上選択してください。")
             else:
-                zip_buffer = io.BytesIO()
-                results = []
-                previews = []
+                zip_buffer, results, previews, artifacts = io.BytesIO(), [], [], []
                 progress = st.progress(0)
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
                     for pdf_index, uploaded_pdf in enumerate(pdf_uploads, start=1):
+                        datasource_id = generate_datasource_id()
                         original_name = uploaded_pdf.name
-                        safe_name = sanitize_document_name(original_name)
                         pdf_bytes = uploaded_pdf.getvalue()
-                        pdf_text, original_title, extraction_error = "", "", None
+                        pdf_text, original_title, extraction_error, extraction_ms = "", "", None, 0.0
                         if include_txt or include_markdown:
+                            extraction_started = time.perf_counter()
                             try:
                                 pdf_text, original_title = extract_pdf_full_text(pdf_bytes)
                             except Exception as exc:
                                 extraction_error = str(exc)
+                            extraction_ms = round((time.perf_counter() - extraction_started) * 1000, 1)
 
-                        selected_formats = []
+                        selected_formats, markdown_ms = [], 0.0
                         if include_pdf:
-                            selected_formats.append(("pdf", f"pdf/{safe_name}.pdf", pdf_bytes, None))
+                            selected_formats.append(("FILE_PDF", "pdf", "source.pdf", pdf_bytes, None, 0.0))
                         if include_txt:
-                            selected_formats.append(("txt", f"txt/{safe_name}.txt", pdf_text, extraction_error))
+                            selected_formats.append(("FILE_TXT", "txt", "source.txt", pdf_text, extraction_error, extraction_ms))
                         if include_markdown:
                             if extraction_error:
-                                selected_formats.append(("markdown", f"markdown/{safe_name}.md", "", extraction_error))
+                                selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", "", extraction_error, extraction_ms))
                             else:
+                                markdown_started = time.perf_counter()
                                 try:
                                     markdown_text = convert_pdf_text_to_markdown(pdf_text, markdown_model_id)
-                                    selected_formats.append(("markdown", f"markdown/{safe_name}.md", markdown_text, None))
+                                    markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
+                                    selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", markdown_text, None, extraction_ms + markdown_ms))
                                 except Exception as exc:
-                                    selected_formats.append(("markdown", f"markdown/{safe_name}.md", "", str(exc)))
+                                    markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
+                                    selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", "", str(exc), extraction_ms + markdown_ms))
 
-                        for format_name, archive_name, content, error in selected_formats:
+                        successful_formats, metadata_by_format = {}, {}
+                        for config_name, format_name, file_name, content, error, conversion_ms in selected_formats:
                             if error:
                                 results.append({
-                                    "元ファイル名 / URL": original_name, "生成形式": format_name,
-                                    "文字数": 0, "結果": "エラー", "エラー内容": error
+                                    "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
+                                    "生成形式": config_name, "文字数": 0, "PDF抽出時間(ms)": extraction_ms,
+                                    "Markdown変換時間(ms)": markdown_ms, "変換時間(ms)": conversion_ms,
+                                    "結果": "失敗", "エラー内容": error
                                 })
                                 continue
                             metadata = build_ingestion_metadata(
                                 "pdf", format_name, ingestion_ui_metadata, pdf_source_url,
-                                original_name, original_title
+                                file_name, original_title, datasource_id, original_name
                             )
+                            archive_name = f"{datasource_id}/{format_name}/{file_name}"
                             output_zip.writestr(archive_name, content)
                             output_zip.writestr(
                                 f"{archive_name}.metadata.json",
@@ -1728,28 +2087,44 @@ elif page == "🧪 データ取り込み検証":
                             # PDFはバイナリなので、比較表示では抽出可能な本文の文字数を使う。
                             char_count = len(content) if isinstance(content, str) else len(pdf_text)
                             results.append({
-                                "元ファイル名 / URL": original_name, "生成形式": format_name,
-                                "文字数": char_count, "結果": "成功", "エラー内容": ""
+                                "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
+                                "生成形式": config_name, "文字数": char_count,
+                                "PDF抽出時間(ms)": extraction_ms, "Markdown変換時間(ms)": markdown_ms,
+                                "変換時間(ms)": conversion_ms, "結果": "成功", "エラー内容": ""
                             })
                             previews.append({
-                                "source": original_name, "format": format_name, "count": char_count,
+                                "datasource_id": datasource_id, "source": original_name,
+                                "format": config_name, "count": char_count,
                                 "metadata": metadata, "text": content[:5000] if isinstance(content, str) else ""
                             })
+                            successful_formats[config_name] = content
+                            metadata_by_format[config_name] = metadata
+                        if "FILE_PDF" in metadata_by_format:
+                            artifacts.extend(build_ingestion_s3_artifacts(
+                                datasource_id, "pdf", successful_formats, metadata_by_format, pdf_bytes
+                            ))
                         progress.progress(pdf_index / len(pdf_uploads))
                 st.session_state.ingestion_pdf_output = {
                     "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+                    "artifacts": artifacts,
                     "filename": datetime.now().strftime("ingestion_test_%Y%m%d%H%M%S.zip")
                 }
+                for stale_key in [
+                    "ingestion_file_upload_results", "ingestion_file_sync_results",
+                    "ingestion_file_synced_config", "ingestion_file_evaluation"
+                ]:
+                    st.session_state.pop(stale_key, None)
 
         if "ingestion_pdf_output" in st.session_state:
             pdf_output = st.session_state.ingestion_pdf_output
             st.subheader("PDF処理結果")
             st.dataframe(pd.DataFrame(pdf_output["results"]), use_container_width=True)
+            st.dataframe(build_conversion_summary(pdf_output["results"]), use_container_width=True)
             for preview in pdf_output["previews"]:
-                with st.expander(f"✅ {preview['source']} / {preview['format']} / {preview['count']}文字"):
+                with st.expander(f"✅ {preview['datasource_id']} / {preview['source']} / {preview['format']} / {preview['count']}文字"):
                     st.json(preview["metadata"])
                     if preview["text"]:
-                        if preview["format"] == "markdown":
+                        if preview["format"] == "FILE_MARKDOWN":
                             st.markdown(preview["text"])
                         else:
                             st.text(preview["text"])
@@ -1771,23 +2146,25 @@ elif page == "🧪 データ取り込み検証":
             elif not any([include_web_txt, include_web_markdown]):
                 st.error("生成形式を1つ以上選択してください。")
             else:
-                results, previews = [], []
+                results, previews, artifacts = [], [], []
                 zip_buffer = io.BytesIO()
                 try:
-                    web_text, web_markdown, web_title = fetch_and_extract_web_page(web_url.strip())
+                    datasource_id = generate_datasource_id()
+                    web_text, web_markdown, web_title, web_metrics = fetch_and_extract_web_page(web_url.strip())
                     fallback_name = urlparse(web_url).path.rstrip("/").split("/")[-1] or "index"
                     safe_name = sanitize_document_name(web_title or fallback_name, fallback="web_page")
-                    formats = []
+                    formats, artifact_formats, metadata_by_format = [], {}, {}
                     if include_web_txt:
-                        formats.append(("txt", f"web_txt/{safe_name}.txt", web_text))
+                        formats.append(("WEB_TXT", "txt", f"web_txt/{safe_name}.txt", web_text))
                     if include_web_markdown:
-                        formats.append(("markdown", f"web_markdown/{safe_name}.md", web_markdown))
+                        formats.append(("WEB_MARKDOWN", "markdown", f"web_markdown/{safe_name}.md", web_markdown))
                     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
-                        for format_name, archive_name, content in formats:
+                        for config_name, format_name, archive_name, content in formats:
                             generated_name = archive_name.rsplit("/", 1)[-1]
+                            kb_file_name = "page.txt" if config_name == "WEB_TXT" else "page.md"
                             metadata = build_ingestion_metadata(
                                 "web", format_name, ingestion_ui_metadata, web_url.strip(),
-                                generated_name, web_title
+                                kb_file_name, web_title, datasource_id, safe_name
                             )
                             output_zip.writestr(archive_name, content)
                             output_zip.writestr(
@@ -1795,31 +2172,51 @@ elif page == "🧪 データ取り込み検証":
                                 json.dumps(metadata, ensure_ascii=False, indent=2)
                             )
                             results.append({
-                                "元ファイル名 / URL": web_url.strip(), "生成形式": format_name,
-                                "文字数": len(content), "結果": "成功", "エラー内容": ""
+                                "datasource_id": datasource_id, "元ファイル名 / URL": web_url.strip(),
+                                "生成形式": config_name, "文字数": len(content),
+                                "HTTP取得時間(ms)": web_metrics["http_fetch_ms"],
+                                "本文抽出時間(ms)": web_metrics["body_extraction_ms"],
+                                "TXT生成時間(ms)": web_metrics["txt_generation_ms"],
+                                "Markdown生成時間(ms)": web_metrics["markdown_generation_ms"],
+                                "変換時間(ms)": web_metrics["total_conversion_ms"],
+                                "結果": "成功", "エラー内容": ""
                             })
                             previews.append({
-                                "source": web_url.strip(), "format": format_name, "count": len(content),
+                                "datasource_id": datasource_id, "source": web_url.strip(),
+                                "format": config_name, "count": len(content),
                                 "metadata": metadata, "text": content[:5000]
                             })
+                            artifact_formats[config_name] = content
+                            metadata_by_format[config_name] = metadata
+                    artifacts = build_ingestion_s3_artifacts(
+                        datasource_id, "web", artifact_formats, metadata_by_format
+                    )
                 except Exception as exc:
                     results.append({
-                        "元ファイル名 / URL": web_url.strip(), "生成形式": "web",
-                        "文字数": 0, "結果": "エラー", "エラー内容": str(exc)
+                        "datasource_id": locals().get("datasource_id", ""),
+                        "元ファイル名 / URL": web_url.strip(), "生成形式": "WEB",
+                        "文字数": 0, "変換時間(ms)": 0, "結果": "失敗", "エラー内容": str(exc)
                     })
                 st.session_state.ingestion_web_output = {
                     "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+                    "artifacts": artifacts,
                     "filename": datetime.now().strftime("web_ingestion_test_%Y%m%d%H%M%S.zip")
                 }
+                for stale_key in [
+                    "ingestion_web_upload_results", "ingestion_web_sync_results",
+                    "ingestion_web_synced_config", "ingestion_web_evaluation"
+                ]:
+                    st.session_state.pop(stale_key, None)
 
         if "ingestion_web_output" in st.session_state:
             web_output = st.session_state.ingestion_web_output
             st.subheader("Web処理結果")
             st.dataframe(pd.DataFrame(web_output["results"]), use_container_width=True)
+            st.dataframe(build_conversion_summary(web_output["results"]), use_container_width=True)
             for preview in web_output["previews"]:
-                with st.expander(f"✅ {preview['source']} / {preview['format']} / {preview['count']}文字"):
+                with st.expander(f"✅ {preview['datasource_id']} / {preview['source']} / {preview['format']} / {preview['count']}文字"):
                     st.json(preview["metadata"])
-                    if preview["format"] == "markdown":
+                    if preview["format"] == "WEB_MARKDOWN":
                         st.markdown(preview["text"])
                     else:
                         st.text(preview["text"])
@@ -1828,6 +2225,271 @@ elif page == "🧪 データ取り込み検証":
                     "Web変換ZIPをダウンロード", web_output["zip"], web_output["filename"],
                     "application/zip", key="download_web_ingestion"
                 )
+
+    st.divider()
+    st.header("ファイル3方式 / Web 2方式 RAG比較")
+    st.warning(
+        "ここでは検証専用の5KBだけを指定してください。KB/Data Sourceの作成・削除や、"
+        "S3既存オブジェクトの上書きは行いません。"
+    )
+
+    default_bucket = _setting("ingestion_test", "s3_bucket", _setting("aws", "s3_bucket", ""))
+    ingestion_bucket = st.text_input(
+        "S3バケット", value=default_bucket, key="ingestion_test_bucket",
+        help="既存PoCで利用しているバケット名。Secretsの ingestion_test.s3_bucket または aws.s3_bucket を初期値に使います。"
+    )
+    config_columns = st.columns(5)
+    ingestion_test_config = {}
+    for column, format_name in zip(config_columns, [*INGESTION_FILE_FORMATS, *INGESTION_WEB_FORMATS]):
+        secret_prefix = format_name.lower()
+        with column:
+            st.markdown(f"**{format_name}**")
+            kb_id = st.text_input(
+                "Knowledge Base ID", value=_setting("ingestion_test", f"{secret_prefix}_knowledge_base_id"),
+                key=f"ingestion_{secret_prefix}_kb_id"
+            )
+            data_source_id = st.text_input(
+                "Data Source ID", value=_setting("ingestion_test", f"{secret_prefix}_data_source_id"),
+                key=f"ingestion_{secret_prefix}_data_source_id"
+            )
+            ingestion_test_config[format_name] = {
+                "knowledge_base_id": kb_id.strip(), "data_source_id": data_source_id.strip()
+            }
+
+    st.caption("各Data Sourceのinclusion prefix（固定）")
+    st.code("\n".join(f"{name}: {prefix}" for name, prefix in INGESTION_TEST_KB_PREFIXES.items()))
+
+    st.subheader("1. S3へ二重配置")
+    upload_col1, upload_col2 = st.columns(2)
+    if upload_col1.button("ファイル成果物をS3へアップロード", key="upload_file_ingestion_to_s3"):
+        for stale_key in ["ingestion_file_upload_results", "ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
+            st.session_state.pop(stale_key, None)
+        subset = {key: ingestion_test_config[key] for key in INGESTION_FILE_FORMATS}
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        output = st.session_state.get("ingestion_pdf_output")
+        if config_errors:
+            for message in config_errors:
+                st.error(message)
+        elif (not output or not output.get("artifacts")
+              or {row["生成形式"] for row in output["results"]} != set(INGESTION_FILE_FORMATS)
+              or any(row["結果"] != "成功" for row in output["results"])):
+            st.error("PDF/TXT/Markdownがすべて成功した変換結果を先に作成してください。")
+        else:
+            try:
+                st.session_state.ingestion_file_upload_results = upload_ingestion_artifacts_to_s3(
+                    output["artifacts"], ingestion_bucket.strip(), "PDF"
+                )
+            except Exception as exc:
+                st.error(f"ファイルS3アップロードエラー: {exc}")
+                st.code(traceback.format_exc())
+
+    if upload_col2.button("Web成果物をS3へアップロード", key="upload_web_ingestion_to_s3"):
+        for stale_key in ["ingestion_web_upload_results", "ingestion_web_sync_results", "ingestion_web_synced_config", "ingestion_web_evaluation"]:
+            st.session_state.pop(stale_key, None)
+        subset = {key: ingestion_test_config[key] for key in INGESTION_WEB_FORMATS}
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        output = st.session_state.get("ingestion_web_output")
+        if config_errors:
+            for message in config_errors:
+                st.error(message)
+        elif (not output or not output.get("artifacts")
+              or {row["生成形式"] for row in output["results"]} != set(INGESTION_WEB_FORMATS)
+              or any(row["結果"] != "成功" for row in output["results"])):
+            st.error("Web TXT/Markdownがすべて成功した変換結果を先に作成してください。")
+        else:
+            try:
+                st.session_state.ingestion_web_upload_results = upload_ingestion_artifacts_to_s3(
+                    output["artifacts"], ingestion_bucket.strip(),
+                    output["results"][0].get("元ファイル名 / URL", "")
+                )
+            except Exception as exc:
+                st.error(f"Web S3アップロードエラー: {exc}")
+                st.code(traceback.format_exc())
+
+    for state_key, label in [
+        ("ingestion_file_upload_results", "ファイルS3アップロード結果"),
+        ("ingestion_web_upload_results", "Web S3アップロード結果")
+    ]:
+        if st.session_state.get(state_key):
+            st.markdown(f"**{label}**")
+            st.dataframe(pd.DataFrame(st.session_state[state_key]), use_container_width=True)
+
+    st.subheader("2. Knowledge Base同期")
+    sync_timeout = st.number_input(
+        "同期タイムアウト（秒）", min_value=60, max_value=7200, value=1800, step=60,
+        key="ingestion_sync_timeout"
+    )
+    def run_sync_group(formats, upload_state, sync_state, config_state):
+        subset = {key: ingestion_test_config[key] for key in formats}
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        upload_results = st.session_state.get(upload_state, [])
+        if config_errors:
+            for message in config_errors:
+                st.error(message)
+            return
+        if not upload_results or any(row["アップロード結果"] != "成功" for row in upload_results):
+            st.error("対象成果物のS3アップロードがすべて成功してから同期してください。")
+            return
+        status_box = st.empty()
+        live_status = {format_name: "STARTING" for format_name in formats}
+
+        def show_status(format_name, status):
+            live_status[format_name] = status
+            status_box.info(" / ".join(f"{name}: {value}" for name, value in live_status.items()))
+
+        sync_rows = run_ingestion_sync(subset, int(sync_timeout), status_callback=show_status)
+        status_box.empty()
+        st.session_state[sync_state] = sync_rows
+        st.session_state[config_state] = json.loads(json.dumps(subset))
+
+    sync_col1, sync_col2 = st.columns(2)
+    if sync_col1.button("ファイル3KBを同期", key="sync_file_ingestion_kbs"):
+        for stale_key in ["ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
+            st.session_state.pop(stale_key, None)
+        try:
+            run_sync_group(INGESTION_FILE_FORMATS, "ingestion_file_upload_results",
+                           "ingestion_file_sync_results", "ingestion_file_synced_config")
+        except Exception as exc:
+            st.error(f"ファイルKnowledge Base同期エラー: {exc}")
+            st.code(traceback.format_exc())
+    if sync_col2.button("Web 2KBを同期", key="sync_web_ingestion_kbs"):
+        for stale_key in ["ingestion_web_sync_results", "ingestion_web_synced_config", "ingestion_web_evaluation"]:
+            st.session_state.pop(stale_key, None)
+        try:
+            run_sync_group(INGESTION_WEB_FORMATS, "ingestion_web_upload_results",
+                           "ingestion_web_sync_results", "ingestion_web_synced_config")
+        except Exception as exc:
+            st.error(f"Web Knowledge Base同期エラー: {exc}")
+            st.code(traceback.format_exc())
+    for state_key in ["ingestion_file_sync_results", "ingestion_web_sync_results"]:
+        if st.session_state.get(state_key):
+            st.dataframe(pd.DataFrame(st.session_state[state_key]), use_container_width=True)
+
+    st.subheader("3. 評価質問CSV")
+    evaluation_csv = st.file_uploader(
+        "評価質問CSV", type=["csv"], key="ingestion_evaluation_csv",
+        help="questionのみ必須。任意列: expected_source, expected_keywords, expected_answer, memo"
+    )
+    evaluation_questions = None
+    if evaluation_csv is not None:
+        try:
+            raw_csv = evaluation_csv.getvalue()
+            try:
+                evaluation_questions = pd.read_csv(io.BytesIO(raw_csv), encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                evaluation_questions = pd.read_csv(io.BytesIO(raw_csv), encoding="cp932")
+            evaluation_questions.columns = [str(column).strip() for column in evaluation_questions.columns]
+            if "question" not in evaluation_questions.columns:
+                st.error("CSVに必須列 question がありません。")
+                evaluation_questions = None
+            else:
+                for optional_column in ["expected_source", "expected_keywords", "expected_answer", "memo"]:
+                    if optional_column not in evaluation_questions.columns:
+                        evaluation_questions[optional_column] = ""
+                evaluation_questions = evaluation_questions.fillna("")
+                evaluation_questions = evaluation_questions[
+                    evaluation_questions["question"].astype(str).str.strip() != ""
+                ]
+                st.dataframe(evaluation_questions, use_container_width=True)
+        except Exception as exc:
+            st.error(f"評価質問CSVの読み込みに失敗しました: {exc}")
+            st.code(traceback.format_exc())
+
+    setting_col1, setting_col2, setting_col3, setting_col4 = st.columns(4)
+    evaluation_search_type = setting_col1.selectbox(
+        "Search Type", ["HYBRID", "SEMANTIC"], key="ingestion_eval_search_type"
+    )
+    evaluation_top_k = setting_col2.selectbox("Top K", [3, 5, 10], index=1, key="ingestion_eval_top_k")
+    evaluation_model = setting_col3.text_input(
+        "回答モデル", value=CHAT_MODEL_ID, key="ingestion_eval_model"
+    )
+    evaluation_max_tokens = setting_col4.selectbox(
+        "Maximum Tokens", [1000, 2000, 4000], index=2, key="ingestion_eval_max_tokens"
+    )
+
+    st.info("比較前提: Hierarchical Chunking / Parent 1500 tokens / Child 300 tokens / Overlap 60 tokens")
+    chunking_confirmed = st.checkbox(
+        "5KBすべてが上記と同じChunking設定であることを確認しました",
+        key="ingestion_chunking_confirmed"
+    )
+
+    def run_evaluation_group(formats, sync_state, config_state, output_state):
+        subset = {key: ingestion_test_config[key] for key in formats}
+        sync_results = st.session_state.get(sync_state, [])
+        full_config_errors = validate_ingestion_test_config(ingestion_bucket, ingestion_test_config)
+        if full_config_errors:
+            for message in full_config_errors:
+                st.error(message)
+        elif not chunking_confirmed:
+            st.error("5KBのChunking条件を確認してください。")
+        elif len(sync_results) != len(formats) or any(row["ステータス"] != "COMPLETE" for row in sync_results):
+            st.error("対象Knowledge Baseの同期がすべてCOMPLETEではありません。")
+        elif st.session_state.get(config_state) != subset:
+            st.error("KB/Data Source IDが同期完了時から変更されています。再同期してください。")
+        elif evaluation_questions is None or evaluation_questions.empty:
+            st.error("questionを含む評価質問CSVをアップロードしてください。")
+        else:
+            progress = st.progress(0)
+            detail_df, comparison_df = evaluate_ingestion_questions(
+                evaluation_questions, subset, evaluation_search_type, evaluation_top_k,
+                evaluation_model.strip(), evaluation_max_tokens, progress_callback=progress.progress
+            )
+            st.session_state[output_state] = {
+                "detail": detail_df, "comparison": comparison_df,
+                "summary": build_ingestion_format_summary(comparison_df),
+                "timestamp": datetime.now().strftime("%Y%m%d%H%M%S")
+            }
+
+    eval_col1, eval_col2 = st.columns(2)
+    if eval_col1.button("ファイルRetrieve比較を実行", type="primary", key="run_file_ingestion_evaluation"):
+        try:
+            run_evaluation_group(INGESTION_FILE_FORMATS, "ingestion_file_sync_results",
+                                 "ingestion_file_synced_config", "ingestion_file_evaluation")
+        except Exception as exc:
+            st.error(f"ファイルRetrieve / 回答生成エラー: {exc}")
+            st.code(traceback.format_exc())
+    if eval_col2.button("Web Retrieve比較を実行", type="primary", key="run_web_ingestion_evaluation"):
+        try:
+            run_evaluation_group(INGESTION_WEB_FORMATS, "ingestion_web_sync_results",
+                                 "ingestion_web_synced_config", "ingestion_web_evaluation")
+        except Exception as exc:
+            st.error(f"Web Retrieve / 回答生成エラー: {exc}")
+            st.code(traceback.format_exc())
+
+    for evaluation_state, label, detail_prefix, comparison_prefix in [
+        ("ingestion_file_evaluation", "ファイル", "ingestion_file_retrieval_detail", "ingestion_file_comparison"),
+        ("ingestion_web_evaluation", "Web", "ingestion_web_retrieval_detail", "ingestion_web_comparison")
+    ]:
+        if not st.session_state.get(evaluation_state):
+            continue
+        evaluation = st.session_state[evaluation_state]
+        st.subheader(f"{label} 質問単位の比較")
+        display_columns = {
+            "question": "Question", "ingestion_format": "Format", "source_hit": "Source Hit",
+            "correct_chunk_rank": "正解チャンク順位", "top_retrieval_score": "Top retrieval score",
+            "keyword_hit_rate": "Keyword hit rate", "answer": "回答",
+            "retrieval_elapsed_ms": "Retrieval時間(ms)",
+            "generation_elapsed_ms": "Generation時間(ms)", "total_elapsed_ms": "Total時間(ms)"
+        }
+        st.dataframe(
+            evaluation["comparison"][list(display_columns)].rename(columns=display_columns),
+            use_container_width=True
+        )
+        st.subheader(f"{label} 方式別サマリー")
+        st.dataframe(evaluation["summary"], use_container_width=True)
+        stamp = evaluation["timestamp"]
+        st.download_button(
+            "Retrieval詳細CSVをダウンロード",
+            evaluation["detail"].to_csv(index=False).encode("utf-8-sig"),
+            f"{detail_prefix}_{stamp}.csv", "text/csv",
+            key=f"download_{detail_prefix}"
+        )
+        st.download_button(
+            "比較サマリーCSVをダウンロード",
+            evaluation["comparison"].to_csv(index=False).encode("utf-8-sig"),
+            f"{comparison_prefix}_{stamp}.csv", "text/csv",
+            key=f"download_{comparison_prefix}"
+        )
 
 # ==========================================
 #  メニュー6：JASSO Q&A取得

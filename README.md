@@ -72,6 +72,54 @@ PDFを複数アップロードし、先頭ページのテキストをClaudeで�
 - `source_file_name`
 - `generated_at`
 
+### データ取り込み比較
+
+同じPDFからPDF原本・TXT・Markdownを生成し、WebページからTXT・Markdownを生成します。
+管理用正本とKB同期用コピーのS3二重配置、5つの検証専用Knowledge Baseの同期、評価質問CSVによる
+Retrieve・回答生成比較、UTF-8 BOM付きCSV出力まで実行します。
+Knowledge BaseとData Source自体は事前にAWS側で作成してください。
+
+Secretsには次の設定を追加できます（画面からの入力も可能です）。
+
+```toml
+[ingestion_test]
+s3_bucket = "YOUR_EXISTING_POC_BUCKET"
+file_pdf_knowledge_base_id = "YOUR_FILE_PDF_KB_ID"
+file_pdf_data_source_id = "YOUR_FILE_PDF_DATA_SOURCE_ID"
+file_txt_knowledge_base_id = "YOUR_FILE_TXT_KB_ID"
+file_txt_data_source_id = "YOUR_FILE_TXT_DATA_SOURCE_ID"
+file_markdown_knowledge_base_id = "YOUR_FILE_MARKDOWN_KB_ID"
+file_markdown_data_source_id = "YOUR_FILE_MARKDOWN_DATA_SOURCE_ID"
+web_txt_knowledge_base_id = "YOUR_WEB_TXT_KB_ID"
+web_txt_data_source_id = "YOUR_WEB_TXT_DATA_SOURCE_ID"
+web_markdown_knowledge_base_id = "YOUR_WEB_MARKDOWN_KB_ID"
+web_markdown_data_source_id = "YOUR_WEB_MARKDOWN_DATA_SOURCE_ID"
+```
+
+管理・追跡用正本は次の構成です。
+
+```text
+documents/ingestion-test/datasource/<datasource_id>/original/
+documents/ingestion-test/datasource/<datasource_id>/processed/
+```
+
+各Data Sourceのinclusion prefixは次の1つだけに設定します。
+
+```text
+FILE_PDF:      documents/ingestion-test/kb-source/file-pdf/
+FILE_TXT:      documents/ingestion-test/kb-source/file-txt/
+FILE_MARKDOWN: documents/ingestion-test/kb-source/file-markdown/
+WEB_TXT:       documents/ingestion-test/kb-source/web-txt/
+WEB_MARKDOWN:  documents/ingestion-test/kb-source/web-markdown/
+```
+
+5つのData Sourceはすべて `Hierarchical Chunking`、Parent 1500 tokens、Child 300 tokens、
+Overlap 60 tokensに手動設定してください。画面上の確認チェックを入れない限り比較は実行できません。
+
+実行ユーザーには最低限、対象prefixへの `s3:PutObject` と既存確認用の `s3:GetObject`、
+対象5KB/Data Sourceへの `bedrock:StartIngestionJob`、`bedrock:GetIngestionJob`、
+`bedrock:Retrieve`、および回答モデルへの `bedrock:InvokeModel` が必要です。
+
 ### JASSO Q&A取得
 
 認可されたJASSO担当者向けアカウントでログインし、「よくあるご質問」のカテゴリ、
