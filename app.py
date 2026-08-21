@@ -1,5 +1,6 @@
 import streamlit as st
 import boto3
+from botocore.config import Config
 import pandas as pd
 import json
 import io
@@ -219,7 +220,12 @@ def create_bedrock_runtime_client():
         service_name="bedrock-runtime",
         region_name="ap-northeast-1",
         aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
-        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"]
+        aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"],
+        config=Config(
+            read_timeout=600,
+            connect_timeout=10,
+            retries={"max_attempts": 3}
+        )
     )
 
 
@@ -247,6 +253,7 @@ INGESTION_TEST_KB_PREFIXES = {
     "WORD_MARKDOWN": "documents/ingestion-test/kb-source/word-markdown/",
 }
 INGESTION_FILE_FORMATS = ("FILE_PDF", "FILE_TXT", "FILE_MARKDOWN")
+PDF_COMPARISON_BUCKET = "chat-bot-poc-plus"
 INGESTION_WEB_FORMATS = ("WEB_TXT", "WEB_MARKDOWN")
 INGESTION_EXCEL_FORMATS = ("EXCEL_XLSX", "EXCEL_CSV", "EXCEL_MARKDOWN")
 INGESTION_WORD_FORMATS = ("WORD_DOCX", "WORD_TXT", "WORD_MARKDOWN")
@@ -273,6 +280,44 @@ INGESTION_WORD_REVIEW_COLUMNS = [
 
 def generate_datasource_id() -> str:
     return f"DS_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+
+def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
+                                       content, metadata: dict) -> str:
+    """PDF比較の1形式をPhase 1用prefixへ上書き保存し、保存先Keyを返す。"""
+    source_name = os.path.basename((original_name or "source.pdf").replace("\\", "/"))
+    source_stem = os.path.splitext(source_name)[0]
+    file_names = {
+        "FILE_PDF": source_name,
+        "FILE_TXT": f"{source_stem}.txt",
+        "FILE_MARKDOWN": f"{source_stem}.md",
+    }
+    if format_name not in file_names:
+        raise ValueError(f"未対応のPDF比較形式です: {format_name}")
+    key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{file_names[format_name]}"
+    if not key.startswith("documents/ingestion-test/kb-source/"):
+        raise ValueError("許可された検証prefix外のS3 Keyです。")
+
+    content_types = {
+        "FILE_PDF": "application/pdf",
+        "FILE_TXT": "text/plain; charset=utf-8",
+        "FILE_MARKDOWN": "text/markdown; charset=utf-8",
+    }
+    body = content if isinstance(content, bytes) else content.encode("utf-8")
+    s3 = create_aws_client("s3")
+    s3.put_object(
+        Bucket=PDF_COMPARISON_BUCKET,
+        Key=key,
+        Body=body,
+        ContentType=content_types[format_name]
+    )
+    s3.put_object(
+        Bucket=PDF_COMPARISON_BUCKET,
+        Key=f"{key}.metadata.json",
+        Body=json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json"
+    )
+    return key
 
 
 def _setting(section: str, key: str, default: str = "") -> str:
@@ -2239,6 +2284,25 @@ elif page == "🧪 データ取り込み検証":
                             )
                             # PDFはバイナリなので、比較表示では抽出可能な本文の文字数を使う。
                             char_count = len(content) if isinstance(content, str) else len(pdf_text)
+                            try:
+                                upload_pdf_comparison_format_to_s3(
+                                    config_name, original_name, content, metadata
+                                )
+                            except Exception as exc:
+                                results.append({
+                                    "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
+                                    "生成形式": config_name, "文字数": char_count,
+                                    "PDF抽出時間(ms)": extraction_ms, "Markdown変換時間(ms)": markdown_ms,
+                                    "変換時間(ms)": conversion_ms, "結果": "失敗",
+                                    "エラー内容": f"S3保存エラー: {exc}"
+                                })
+                                previews.append({
+                                    "datasource_id": datasource_id, "source": original_name,
+                                    "format": config_name, "count": char_count,
+                                    "metadata": metadata,
+                                    "text": content[:5000] if isinstance(content, str) else ""
+                                })
+                                continue
                             results.append({
                                 "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
                                 "生成形式": config_name, "文字数": char_count,
