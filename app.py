@@ -17,6 +17,8 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from jasso_crawler import JassoCrawler
 from jasso_exporter import build_outputs
+from ingestion_excel import parse_xlsx_workbook
+from ingestion_word import parse_docx_document
 
 # ==========================================
 #  ダイアログ：フィードバック送信
@@ -237,15 +239,35 @@ INGESTION_TEST_KB_PREFIXES = {
     "FILE_MARKDOWN": "documents/ingestion-test/kb-source/file-markdown/",
     "WEB_TXT": "documents/ingestion-test/kb-source/web-txt/",
     "WEB_MARKDOWN": "documents/ingestion-test/kb-source/web-markdown/",
+    "EXCEL_XLSX": "documents/ingestion-test/kb-source/excel-xlsx/",
+    "EXCEL_CSV": "documents/ingestion-test/kb-source/excel-csv/",
+    "EXCEL_MARKDOWN": "documents/ingestion-test/kb-source/excel-markdown/",
+    "WORD_DOCX": "documents/ingestion-test/kb-source/word-docx/",
+    "WORD_TXT": "documents/ingestion-test/kb-source/word-txt/",
+    "WORD_MARKDOWN": "documents/ingestion-test/kb-source/word-markdown/",
 }
 INGESTION_FILE_FORMATS = ("FILE_PDF", "FILE_TXT", "FILE_MARKDOWN")
 INGESTION_WEB_FORMATS = ("WEB_TXT", "WEB_MARKDOWN")
+INGESTION_EXCEL_FORMATS = ("EXCEL_XLSX", "EXCEL_CSV", "EXCEL_MARKDOWN")
+INGESTION_WORD_FORMATS = ("WORD_DOCX", "WORD_TXT", "WORD_MARKDOWN")
 INGESTION_SYNC_SUCCESS_STATUSES = {"COMPLETE"}
 INGESTION_SYNC_FAILURE_STATUSES = {"FAILED", "STOPPED"}
 INGESTION_MANUAL_REVIEW_COLUMNS = [
     "table_preservation", "heading_structure", "reading_order", "chunk_quality",
     "required_information_present", "irrelevant_source_retrieved", "answer_accuracy",
     "answer_completeness", "unsupported_information", "citation_accuracy", "review_comment"
+]
+INGESTION_EXCEL_REVIEW_COLUMNS = [
+    "sheet_name_preservation", "table_title_preservation", "row_header_preservation",
+    "column_header_preservation", "merged_cell_context_preservation",
+    "number_format_preservation", "unit_preservation", "footnote_preservation",
+    "cross_sheet_retrieval", "formula_value_consistency"
+]
+INGESTION_WORD_REVIEW_COLUMNS = [
+    "heading_level_preservation", "paragraph_order_preservation", "bullet_list_preservation",
+    "numbered_list_preservation", "table_structure_preservation", "merged_cell_context_preservation",
+    "hyperlink_preservation", "header_footer_separation", "page_break_preservation",
+    "footnote_preservation", "comment_preservation"
 ]
 
 
@@ -320,6 +342,125 @@ def build_ingestion_s3_artifacts(datasource_id: str, source_type: str, formats: 
     return artifacts
 
 
+def build_excel_ingestion_artifacts(xlsx_bytes: bytes, original_name: str, datasource_id: str,
+                                    workbook_result: dict, ui_metadata: dict) -> tuple[list[dict], dict]:
+    """Excelの管理用正本と3方式のKB同期用コピー、sidecar metadataを生成する。"""
+    root = f"documents/ingestion-test/datasource/{datasource_id}/"
+    sheet_names = [part["sheet_name"] for part in workbook_result["parts"]]
+    common_excel_metadata = {
+        "source_file_type": "excel", "workbook_name": original_name,
+        "sheet_name": ", ".join(sheet_names), "sheet_index": 0,
+        "sheet_count": workbook_result["sheet_count"], "document_part_id": "",
+        "original_extension": ".xlsx", "formula_mode": "cached_value",
+        "cell_range": "", "table_name": ""
+    }
+    xlsx_metadata = build_ingestion_metadata(
+        "excel", "xlsx_original", ui_metadata, "", "source.xlsx", original_name,
+        datasource_id, original_name
+    )
+    xlsx_metadata["metadataAttributes"].update({
+        **common_excel_metadata, "conversion_method": "original"
+    })
+    artifacts = []
+
+    def add_pair(format_name: str, role: str, key: str, body: bytes, content_type: str, metadata: dict):
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        artifacts.extend([
+            {"datasource_id": datasource_id, "format": format_name, "role": role,
+             "key": key, "body": body, "content_type": content_type},
+            {"datasource_id": datasource_id, "format": format_name, "role": role,
+             "key": f"{key}.metadata.json", "body": metadata_bytes,
+             "content_type": "application/json"}
+        ])
+
+    add_pair("ORIGINAL", "管理用正本", f"{root}original/source.xlsx", xlsx_bytes,
+             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_metadata)
+    add_pair("EXCEL_XLSX", "管理用正本", f"{root}processed/excel-xlsx/source.xlsx", xlsx_bytes,
+             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_metadata)
+    add_pair("EXCEL_XLSX", "KB同期用コピー",
+             f"{INGESTION_TEST_KB_PREFIXES['EXCEL_XLSX']}{datasource_id}/source.xlsx", xlsx_bytes,
+             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_metadata)
+
+    part_outputs = []
+    for part in workbook_result["parts"]:
+        part_common = {
+            "source_file_type": "excel", "workbook_name": original_name,
+            "sheet_name": part["sheet_name"], "sheet_index": part["sheet_index"],
+            "sheet_count": part["sheet_count"], "document_part_id": part["document_part_id"],
+            "original_extension": ".xlsx", "formula_mode": "cached_value",
+            "cell_range": part["cell_range"], "table_name": part["table_name"]
+        }
+        format_specs = [
+            ("EXCEL_CSV", "csv", "sheet_to_csv", ".csv", part["csv_bytes"], "text/csv; charset=utf-8"),
+            ("EXCEL_MARKDOWN", "markdown", "sheet_to_markdown", ".md",
+             part["markdown_text"].encode("utf-8"), "text/markdown; charset=utf-8")
+        ]
+        output_metadata = {}
+        for format_name, ingestion_format, conversion_method, extension, body, content_type in format_specs:
+            file_name = f"{part['document_part_id']}{extension}"
+            metadata = build_ingestion_metadata(
+                "excel", ingestion_format, ui_metadata, "", file_name, original_name,
+                datasource_id, original_name
+            )
+            metadata["metadataAttributes"].update({
+                **part_common, "conversion_method": conversion_method
+            })
+            canonical_key = f"{root}processed/excel-{ingestion_format}/{file_name}"
+            kb_key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{datasource_id}/{file_name}"
+            add_pair(format_name, "管理用正本", canonical_key, body, content_type, metadata)
+            add_pair(format_name, "KB同期用コピー", kb_key, body, content_type, metadata)
+            output_metadata[format_name] = metadata
+        part_outputs.append({**part, "metadata": output_metadata})
+    return artifacts, {"xlsx_metadata": xlsx_metadata, "parts": part_outputs}
+
+
+def build_word_ingestion_artifacts(docx_bytes: bytes, original_name: str, datasource_id: str,
+                                   word_result: dict, ui_metadata: dict) -> tuple[list[dict], dict]:
+    root = f"documents/ingestion-test/datasource/{datasource_id}/"
+    common = {
+        "source_file_type": "word", "original_extension": ".docx",
+        "paragraph_count": word_result["paragraph_count"], "table_count": word_result["table_count"],
+        "heading_count": word_result["heading_count"], "header_present": word_result["header_present"],
+        "footer_present": word_result["footer_present"],
+        "unsupported_elements": word_result["unsupported_elements"]
+    }
+    specs = [
+        ("WORD_DOCX", "docx_original", "original", "source.docx", docx_bytes,
+         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("WORD_TXT", "txt", "docx_to_txt", "source.txt", word_result["txt_text"].encode("utf-8"),
+         "text/plain; charset=utf-8"),
+        ("WORD_MARKDOWN", "markdown", "docx_to_markdown", "source.md",
+         word_result["markdown_text"].encode("utf-8"), "text/markdown; charset=utf-8")
+    ]
+    metadata_by_format, artifacts = {}, []
+
+    def add_pair(format_name, role, key, body, content_type, metadata):
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        artifacts.extend([
+            {"datasource_id": datasource_id, "format": format_name, "role": role,
+             "key": key, "body": body, "content_type": content_type},
+            {"datasource_id": datasource_id, "format": format_name, "role": role,
+             "key": f"{key}.metadata.json", "body": metadata_bytes, "content_type": "application/json"}
+        ])
+
+    for format_name, ingestion_format, method, file_name, body, content_type in specs:
+        metadata = build_ingestion_metadata(
+            "word", ingestion_format, ui_metadata, "", file_name, word_result["title"],
+            datasource_id, original_name
+        )
+        metadata["metadataAttributes"].update({**common, "conversion_method": method})
+        metadata_by_format[format_name] = metadata
+        folder = {"WORD_DOCX": "word-docx", "WORD_TXT": "word-txt", "WORD_MARKDOWN": "word-markdown"}[format_name]
+        add_pair(format_name, "管理用正本", f"{root}processed/{folder}/{file_name}", body, content_type, metadata)
+        add_pair(format_name, "KB同期用コピー",
+                 f"{INGESTION_TEST_KB_PREFIXES[format_name]}{datasource_id}/{file_name}",
+                 body, content_type, metadata)
+    add_pair("ORIGINAL", "管理用正本", f"{root}original/source.docx", docx_bytes,
+             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+             metadata_by_format["WORD_DOCX"])
+    return artifacts, metadata_by_format
+
+
 def upload_ingestion_artifacts_to_s3(artifacts: list[dict], bucket: str,
                                      source_label: str = "") -> list[dict]:
     """許可済み検証prefixの成果物を既存オブジェクトへ上書きせずアップロードする。"""
@@ -333,6 +474,7 @@ def upload_ingestion_artifacts_to_s3(artifacts: list[dict], bucket: str,
             "datasource_id": artifact["datasource_id"], "元データ": source_label,
             "形式": artifact["format"], "配置区分": artifact["role"],
             "S3 Key": s3_key, "アップロード結果": "失敗", "所要時間(ms)": 0,
+            "s3_upload_ms": 0,
             "エラー内容": ""
         }
         try:
@@ -352,6 +494,7 @@ def upload_ingestion_artifacts_to_s3(artifacts: list[dict], bucket: str,
         except Exception as exc:
             row["エラー内容"] = str(exc)
         row["所要時間(ms)"] = round((time.perf_counter() - started) * 1000, 1)
+        row["s3_upload_ms"] = row["所要時間(ms)"]
         rows.append(row)
     return rows
 
@@ -374,7 +517,8 @@ def run_ingestion_sync(config: dict, timeout_seconds: int, status_callback=None)
         except Exception as exc:
             results.append({
                 "形式": format_name, "開始時刻": started_at, "終了時刻": datetime.now(),
-                "所要時間(秒)": 0, "ステータス": "FAILED", "失敗理由": str(exc)
+                "所要時間(秒)": 0, "kb_sync_seconds": 0,
+                "ステータス": "FAILED", "失敗理由": str(exc)
             })
 
     deadline = time.monotonic() + timeout_seconds
@@ -395,6 +539,7 @@ def run_ingestion_sync(config: dict, timeout_seconds: int, status_callback=None)
                     results.append({
                         "形式": format_name, "開始時刻": job["started_at"], "終了時刻": ended_at,
                         "所要時間(秒)": round((ended_at - job["started_at"]).total_seconds(), 1),
+                        "kb_sync_seconds": round((ended_at - job["started_at"]).total_seconds(), 1),
                         "ステータス": job["status"], "失敗理由": " / ".join(reasons)
                     })
                     del jobs[format_name]
@@ -403,6 +548,7 @@ def run_ingestion_sync(config: dict, timeout_seconds: int, status_callback=None)
                 results.append({
                     "形式": format_name, "開始時刻": job["started_at"], "終了時刻": ended_at,
                     "所要時間(秒)": round((ended_at - job["started_at"]).total_seconds(), 1),
+                    "kb_sync_seconds": round((ended_at - job["started_at"]).total_seconds(), 1),
                     "ステータス": "FAILED", "失敗理由": str(exc)
                 })
                 del jobs[format_name]
@@ -413,6 +559,7 @@ def run_ingestion_sync(config: dict, timeout_seconds: int, status_callback=None)
         results.append({
             "形式": format_name, "開始時刻": job["started_at"], "終了時刻": ended_at,
             "所要時間(秒)": round((ended_at - job["started_at"]).total_seconds(), 1),
+            "kb_sync_seconds": round((ended_at - job["started_at"]).total_seconds(), 1),
             "ステータス": "TIMEOUT", "失敗理由": f"{timeout_seconds}秒でタイムアウトしました。"
         })
     return results
@@ -519,7 +666,11 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
                 "expected_source": expected_source,
                 "expected_keywords": ",".join(keywords), "expected_answer": expected_answer,
                 "memo": str(question_row.get("memo", "") or ""),
-                **{column: "" for column in INGESTION_MANUAL_REVIEW_COLUMNS}
+                **{column: "" for column in [
+                    *INGESTION_MANUAL_REVIEW_COLUMNS,
+                    *(INGESTION_EXCEL_REVIEW_COLUMNS if format_name.startswith("EXCEL_") else []),
+                    *(INGESTION_WORD_REVIEW_COLUMNS if format_name.startswith("WORD_") else [])
+                ]}
             })
             completed += 1
             if progress_callback:
@@ -2001,7 +2152,9 @@ elif page == "🧪 データ取り込み検証":
         "priority": ingestion_priority
     }
 
-    pdf_tab, web_tab = st.tabs(["PDF取り込み比較", "Webページ取り込み"])
+    pdf_tab, web_tab, excel_tab, word_tab = st.tabs([
+        "PDF取り込み比較", "Webページ取り込み", "Excel取り込み比較", "Word取り込み比較"
+    ])
 
     with pdf_tab:
         st.subheader("PDF取り込み比較")
@@ -2226,10 +2379,229 @@ elif page == "🧪 データ取り込み検証":
                     "application/zip", key="download_web_ingestion"
                 )
 
+    with excel_tab:
+        st.subheader("Excel取り込み比較（.xlsx）")
+        excel_uploads = st.file_uploader(
+            "XLSXファイル（複数選択可）", type=["xlsx"], accept_multiple_files=True,
+            key="ingestion_excel_uploads"
+        )
+        st.caption(
+            "表示・非空シートだけを対象に、XLSX原本、1シート1CSV、1シート1Markdownを生成します。"
+            "数式は再計算せず保存済み値を優先します。"
+        )
+        if excel_uploads:
+            st.dataframe(pd.DataFrame([
+                {"元ファイル名": item.name, "サイズ(KB)": round(len(item.getvalue()) / 1024, 1)}
+                for item in excel_uploads
+            ]), use_container_width=True)
+
+        if st.button("Excel変換を実行", type="primary", key="run_excel_ingestion"):
+            if not excel_uploads:
+                st.error("XLSXファイルを1件以上アップロードしてください。")
+            else:
+                results, workbooks, artifacts = [], [], []
+                zip_buffer = io.BytesIO()
+                progress = st.progress(0)
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                    for excel_index, uploaded_excel in enumerate(excel_uploads, start=1):
+                        datasource_id = generate_datasource_id()
+                        xlsx_bytes = uploaded_excel.getvalue()
+                        conversion_started = time.perf_counter()
+                        try:
+                            workbook_result = parse_xlsx_workbook(xlsx_bytes, uploaded_excel.name, datasource_id)
+                            if not workbook_result["parts"]:
+                                raise ValueError("表示状態の非空シートがありません。")
+                            excel_artifacts, preview_data = build_excel_ingestion_artifacts(
+                                xlsx_bytes, uploaded_excel.name, datasource_id,
+                                workbook_result, ingestion_ui_metadata
+                            )
+                            artifacts.extend(excel_artifacts)
+                            output_zip.writestr(f"{datasource_id}/xlsx/source.xlsx", xlsx_bytes)
+                            output_zip.writestr(
+                                f"{datasource_id}/xlsx/source.xlsx.metadata.json",
+                                json.dumps(preview_data["xlsx_metadata"], ensure_ascii=False, indent=2)
+                            )
+                            for part in preview_data["parts"]:
+                                output_zip.writestr(f"{datasource_id}/csv/{part['document_part_id']}.csv", part["csv_bytes"])
+                                output_zip.writestr(
+                                    f"{datasource_id}/csv/{part['document_part_id']}.csv.metadata.json",
+                                    json.dumps(part["metadata"]["EXCEL_CSV"], ensure_ascii=False, indent=2)
+                                )
+                                output_zip.writestr(
+                                    f"{datasource_id}/markdown/{part['document_part_id']}.md", part["markdown_text"]
+                                )
+                                output_zip.writestr(
+                                    f"{datasource_id}/markdown/{part['document_part_id']}.md.metadata.json",
+                                    json.dumps(part["metadata"]["EXCEL_MARKDOWN"], ensure_ascii=False, indent=2)
+                                )
+                            conversion_ms = round((time.perf_counter() - conversion_started) * 1000, 1)
+                            results.append({
+                                "元ファイル名": uploaded_excel.name, "datasource_id": datasource_id,
+                                "シート数": workbook_result["sheet_count"],
+                                "workbook_load_ms": workbook_result["workbook_load_ms"],
+                                "sheet_parse_ms": round(sum(p["sheet_parse_ms"] for p in workbook_result["parts"]), 1),
+                                "csv_generation_ms": round(sum(p["csv_generation_ms"] for p in workbook_result["parts"]), 1),
+                                "markdown_generation_ms": round(sum(p["markdown_generation_ms"] for p in workbook_result["parts"]), 1),
+                                "generated_file_count": workbook_result["generated_file_count"],
+                                "generated_total_bytes": workbook_result["generated_total_bytes"],
+                                "変換時間(ms)": conversion_ms, "結果": "成功", "エラー内容": ""
+                            })
+                            workbooks.append({
+                                "datasource_id": datasource_id, "original_name": uploaded_excel.name,
+                                "result": workbook_result, "preview": preview_data
+                            })
+                        except Exception as exc:
+                            results.append({
+                                "元ファイル名": uploaded_excel.name, "datasource_id": datasource_id,
+                                "シート数": 0, "workbook_load_ms": 0, "sheet_parse_ms": 0,
+                                "csv_generation_ms": 0, "markdown_generation_ms": 0,
+                                "generated_file_count": 0, "generated_total_bytes": 0,
+                                "変換時間(ms)": round((time.perf_counter() - conversion_started) * 1000, 1),
+                                "結果": "失敗", "エラー内容": str(exc)
+                            })
+                        progress.progress(excel_index / len(excel_uploads))
+                failure_count = sum(row["結果"] != "成功" for row in results)
+                for row in results:
+                    row["conversion_failure_rate"] = failure_count / len(results) if results else 0
+                st.session_state.ingestion_excel_output = {
+                    "zip": zip_buffer.getvalue(), "results": results, "workbooks": workbooks,
+                    "artifacts": artifacts,
+                    "filename": datetime.now().strftime("excel_ingestion_test_%Y%m%d%H%M%S.zip")
+                }
+                for stale_key in [
+                    "ingestion_excel_upload_results", "ingestion_excel_sync_results",
+                    "ingestion_excel_synced_config", "ingestion_excel_evaluation"
+                ]:
+                    st.session_state.pop(stale_key, None)
+
+        if st.session_state.get("ingestion_excel_output"):
+            excel_output = st.session_state.ingestion_excel_output
+            st.subheader("Excel処理結果")
+            st.dataframe(pd.DataFrame(excel_output["results"]), use_container_width=True)
+            for workbook in excel_output["workbooks"]:
+                result = workbook["result"]
+                st.markdown(f"**{workbook['original_name']} / {workbook['datasource_id']}**")
+                sheet_rows = [{
+                    "対象シート名": part["sheet_name"], "シートindex": part["sheet_index"],
+                    "使用セル範囲": part["cell_range"], "Excel Table名": part["table_name"],
+                    "行数": part["row_count"], "列数": part["column_count"],
+                    "document_part_id": part["document_part_id"]
+                } for part in result["parts"]]
+                st.dataframe(pd.DataFrame(sheet_rows), use_container_width=True)
+                with st.expander("XLSX原本プレビュー（シート一覧・先頭30行）"):
+                    for part in result["parts"]:
+                        st.markdown(f"**{part['sheet_name']}**")
+                        st.dataframe(pd.DataFrame(part["preview_rows"]), use_container_width=True)
+                for part in workbook["preview"]["parts"]:
+                    with st.expander(f"CSV / {part['sheet_name']} / {part['document_part_id']}"):
+                        st.dataframe(pd.DataFrame(part["preview_rows"]), use_container_width=True)
+                    with st.expander(f"Markdown / {part['sheet_name']} / {part['document_part_id']}"):
+                        st.markdown(part["markdown_text"])
+            st.download_button(
+                "Excel比較ZIPをダウンロード", excel_output["zip"], excel_output["filename"],
+                "application/zip", key="download_excel_ingestion"
+            )
+
+    with word_tab:
+        st.subheader("Word取り込み比較（.docx）")
+        word_uploads = st.file_uploader(
+            "DOCXファイル（複数選択可）", type=["docx"], accept_multiple_files=True,
+            key="ingestion_word_uploads"
+        )
+        st.caption("文書順を維持してDOCX原本、構造付きTXT、Markdownを生成します。旧.docは対象外です。")
+        if st.button("Word変換を実行", type="primary", key="run_word_ingestion"):
+            if not word_uploads:
+                st.error("DOCXファイルを1件以上アップロードしてください。")
+            else:
+                results, previews, artifacts = [], [], []
+                zip_buffer = io.BytesIO()
+                progress = st.progress(0)
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                    for word_index, uploaded_word in enumerate(word_uploads, start=1):
+                        datasource_id = generate_datasource_id()
+                        docx_bytes = uploaded_word.getvalue()
+                        started = time.perf_counter()
+                        try:
+                            word_result = parse_docx_document(docx_bytes, uploaded_word.name)
+                            word_artifacts, metadata = build_word_ingestion_artifacts(
+                                docx_bytes, uploaded_word.name, datasource_id, word_result, ingestion_ui_metadata
+                            )
+                            artifacts.extend(word_artifacts)
+                            for folder, file_name, content, format_name in [
+                                ("docx", "source.docx", docx_bytes, "WORD_DOCX"),
+                                ("txt", "source.txt", word_result["txt_text"], "WORD_TXT"),
+                                ("markdown", "source.md", word_result["markdown_text"], "WORD_MARKDOWN")
+                            ]:
+                                path = f"{datasource_id}/{folder}/{file_name}"
+                                output_zip.writestr(path, content)
+                                output_zip.writestr(
+                                    f"{path}.metadata.json",
+                                    json.dumps(metadata[format_name], ensure_ascii=False, indent=2)
+                                )
+                            results.append({
+                                "元ファイル名": uploaded_word.name, "datasource_id": datasource_id,
+                                "文書タイトル": word_result["title"],
+                                "段落数": word_result["paragraph_count"], "見出し数": word_result["heading_count"],
+                                "表数": word_result["table_count"], "ヘッダー有無": word_result["header_present"],
+                                "フッター有無": word_result["footer_present"],
+                                "docx_load_ms": word_result["docx_load_ms"],
+                                "paragraph_parse_ms": word_result["paragraph_parse_ms"],
+                                "table_parse_ms": word_result["table_parse_ms"],
+                                "txt_generation_ms": word_result["txt_generation_ms"],
+                                "markdown_generation_ms": word_result["markdown_generation_ms"],
+                                "generated_file_count": word_result["generated_file_count"],
+                                "generated_total_bytes": word_result["generated_total_bytes"],
+                                "変換時間(ms)": round((time.perf_counter() - started) * 1000, 1),
+                                "結果": "成功", "エラー内容": ""
+                            })
+                            previews.append({
+                                "datasource_id": datasource_id, "name": uploaded_word.name,
+                                "result": word_result, "metadata": metadata
+                            })
+                        except Exception as exc:
+                            results.append({
+                                "元ファイル名": uploaded_word.name, "datasource_id": datasource_id,
+                                "文書タイトル": "", "段落数": 0, "見出し数": 0, "表数": 0,
+                                "ヘッダー有無": False, "フッター有無": False,
+                                "docx_load_ms": 0, "paragraph_parse_ms": 0, "table_parse_ms": 0,
+                                "txt_generation_ms": 0, "markdown_generation_ms": 0,
+                                "generated_file_count": 0, "generated_total_bytes": 0,
+                                "変換時間(ms)": round((time.perf_counter() - started) * 1000, 1),
+                                "結果": "失敗", "エラー内容": str(exc)
+                            })
+                        progress.progress(word_index / len(word_uploads))
+                failures = sum(row["結果"] != "成功" for row in results)
+                for row in results:
+                    row["conversion_failure_rate"] = failures / len(results) if results else 0
+                st.session_state.ingestion_word_output = {
+                    "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+                    "artifacts": artifacts,
+                    "filename": datetime.now().strftime("word_ingestion_test_%Y%m%d%H%M%S.zip")
+                }
+                for key in ["ingestion_word_upload_results", "ingestion_word_sync_results",
+                            "ingestion_word_synced_config", "ingestion_word_evaluation"]:
+                    st.session_state.pop(key, None)
+
+        if st.session_state.get("ingestion_word_output"):
+            word_output = st.session_state.ingestion_word_output
+            st.dataframe(pd.DataFrame(word_output["results"]), use_container_width=True)
+            for preview in word_output["previews"]:
+                result = preview["result"]
+                with st.expander(f"DOCX原本情報 / {preview['name']} / {preview['datasource_id']}"):
+                    st.json(preview["metadata"]["WORD_DOCX"])
+                with st.expander(f"TXTプレビュー / {preview['name']}"):
+                    st.text(result["txt_text"][:20000])
+                with st.expander(f"Markdownプレビュー / {preview['name']}"):
+                    st.markdown(result["markdown_text"][:20000])
+            st.download_button(
+                "Word比較ZIPをダウンロード", word_output["zip"], word_output["filename"],
+                "application/zip", key="download_word_ingestion"
+            )
+
     st.divider()
-    st.header("ファイル3方式 / Web 2方式 RAG比較")
+    st.header("PDF 3方式 / Web 2方式 / Excel 3方式 / Word 3方式 RAG比較")
     st.warning(
-        "ここでは検証専用の5KBだけを指定してください。KB/Data Sourceの作成・削除や、"
+        "ここでは検証専用KBだけを指定してください。KB/Data Sourceの作成・削除や、"
         "S3既存オブジェクトの上書きは行いません。"
     )
 
@@ -2256,11 +2628,47 @@ elif page == "🧪 データ取り込み検証":
                 "knowledge_base_id": kb_id.strip(), "data_source_id": data_source_id.strip()
             }
 
+    st.markdown("**Word専用3KB**")
+    word_config_columns = st.columns(3)
+    for column, format_name in zip(word_config_columns, INGESTION_WORD_FORMATS):
+        secret_prefix = format_name.lower()
+        with column:
+            st.markdown(f"**{format_name}**")
+            kb_id = st.text_input(
+                "Knowledge Base ID", value=_setting("ingestion_test", f"{secret_prefix}_knowledge_base_id"),
+                key=f"ingestion_{secret_prefix}_kb_id"
+            )
+            data_source_id = st.text_input(
+                "Data Source ID", value=_setting("ingestion_test", f"{secret_prefix}_data_source_id"),
+                key=f"ingestion_{secret_prefix}_data_source_id"
+            )
+            ingestion_test_config[format_name] = {
+                "knowledge_base_id": kb_id.strip(), "data_source_id": data_source_id.strip()
+            }
+
+    st.markdown("**Excel専用3KB**")
+    excel_config_columns = st.columns(3)
+    for column, format_name in zip(excel_config_columns, INGESTION_EXCEL_FORMATS):
+        secret_prefix = format_name.lower()
+        with column:
+            st.markdown(f"**{format_name}**")
+            kb_id = st.text_input(
+                "Knowledge Base ID", value=_setting("ingestion_test", f"{secret_prefix}_knowledge_base_id"),
+                key=f"ingestion_{secret_prefix}_kb_id"
+            )
+            data_source_id = st.text_input(
+                "Data Source ID", value=_setting("ingestion_test", f"{secret_prefix}_data_source_id"),
+                key=f"ingestion_{secret_prefix}_data_source_id"
+            )
+            ingestion_test_config[format_name] = {
+                "knowledge_base_id": kb_id.strip(), "data_source_id": data_source_id.strip()
+            }
+
     st.caption("各Data Sourceのinclusion prefix（固定）")
     st.code("\n".join(f"{name}: {prefix}" for name, prefix in INGESTION_TEST_KB_PREFIXES.items()))
 
     st.subheader("1. S3へ二重配置")
-    upload_col1, upload_col2 = st.columns(2)
+    upload_col1, upload_col2, upload_col3, upload_col4 = st.columns(4)
     if upload_col1.button("ファイル成果物をS3へアップロード", key="upload_file_ingestion_to_s3"):
         for stale_key in ["ingestion_file_upload_results", "ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
             st.session_state.pop(stale_key, None)
@@ -2306,9 +2714,52 @@ elif page == "🧪 データ取り込み検証":
                 st.error(f"Web S3アップロードエラー: {exc}")
                 st.code(traceback.format_exc())
 
+    if upload_col3.button("Excel成果物をS3へアップロード", key="upload_excel_ingestion_to_s3"):
+        for stale_key in ["ingestion_excel_upload_results", "ingestion_excel_sync_results", "ingestion_excel_synced_config", "ingestion_excel_evaluation"]:
+            st.session_state.pop(stale_key, None)
+        subset = {key: ingestion_test_config[key] for key in INGESTION_EXCEL_FORMATS}
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        output = st.session_state.get("ingestion_excel_output")
+        if config_errors:
+            for message in config_errors:
+                st.error(message)
+        elif not output or not output.get("artifacts") or any(row["結果"] != "成功" for row in output["results"]):
+            st.error("XLSX/CSV/Markdownがすべて成功したExcel変換結果を先に作成してください。")
+        else:
+            try:
+                st.session_state.ingestion_excel_upload_results = upload_ingestion_artifacts_to_s3(
+                    output["artifacts"], ingestion_bucket.strip(), "Excel"
+                )
+            except Exception as exc:
+                st.error(f"Excel S3アップロードエラー: {exc}")
+                st.code(traceback.format_exc())
+
+    if upload_col4.button("Word成果物をS3へアップロード", key="upload_word_ingestion_to_s3"):
+        for key in ["ingestion_word_upload_results", "ingestion_word_sync_results",
+                    "ingestion_word_synced_config", "ingestion_word_evaluation"]:
+            st.session_state.pop(key, None)
+        subset = {key: ingestion_test_config[key] for key in INGESTION_WORD_FORMATS}
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        output = st.session_state.get("ingestion_word_output")
+        if config_errors:
+            for message in config_errors:
+                st.error(message)
+        elif not output or not output.get("artifacts") or any(row["結果"] != "成功" for row in output["results"]):
+            st.error("DOCX/TXT/Markdownがすべて成功したWord変換結果を先に作成してください。")
+        else:
+            try:
+                st.session_state.ingestion_word_upload_results = upload_ingestion_artifacts_to_s3(
+                    output["artifacts"], ingestion_bucket.strip(), "Word"
+                )
+            except Exception as exc:
+                st.error(f"Word S3アップロードエラー: {exc}")
+                st.code(traceback.format_exc())
+
     for state_key, label in [
         ("ingestion_file_upload_results", "ファイルS3アップロード結果"),
-        ("ingestion_web_upload_results", "Web S3アップロード結果")
+        ("ingestion_web_upload_results", "Web S3アップロード結果"),
+        ("ingestion_excel_upload_results", "Excel S3アップロード結果"),
+        ("ingestion_word_upload_results", "Word S3アップロード結果")
     ]:
         if st.session_state.get(state_key):
             st.markdown(f"**{label}**")
@@ -2342,7 +2793,7 @@ elif page == "🧪 データ取り込み検証":
         st.session_state[sync_state] = sync_rows
         st.session_state[config_state] = json.loads(json.dumps(subset))
 
-    sync_col1, sync_col2 = st.columns(2)
+    sync_col1, sync_col2, sync_col3, sync_col4 = st.columns(4)
     if sync_col1.button("ファイル3KBを同期", key="sync_file_ingestion_kbs"):
         for stale_key in ["ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
             st.session_state.pop(stale_key, None)
@@ -2361,7 +2812,28 @@ elif page == "🧪 データ取り込み検証":
         except Exception as exc:
             st.error(f"Web Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
-    for state_key in ["ingestion_file_sync_results", "ingestion_web_sync_results"]:
+    if sync_col3.button("Excel 3KBを同期", key="sync_excel_ingestion_kbs"):
+        for stale_key in ["ingestion_excel_sync_results", "ingestion_excel_synced_config", "ingestion_excel_evaluation"]:
+            st.session_state.pop(stale_key, None)
+        try:
+            run_sync_group(INGESTION_EXCEL_FORMATS, "ingestion_excel_upload_results",
+                           "ingestion_excel_sync_results", "ingestion_excel_synced_config")
+        except Exception as exc:
+            st.error(f"Excel Knowledge Base同期エラー: {exc}")
+            st.code(traceback.format_exc())
+    if sync_col4.button("Word 3KBを同期", key="sync_word_ingestion_kbs"):
+        for key in ["ingestion_word_sync_results", "ingestion_word_synced_config", "ingestion_word_evaluation"]:
+            st.session_state.pop(key, None)
+        try:
+            run_sync_group(INGESTION_WORD_FORMATS, "ingestion_word_upload_results",
+                           "ingestion_word_sync_results", "ingestion_word_synced_config")
+        except Exception as exc:
+            st.error(f"Word Knowledge Base同期エラー: {exc}")
+            st.code(traceback.format_exc())
+    for state_key in [
+        "ingestion_file_sync_results", "ingestion_web_sync_results", "ingestion_excel_sync_results",
+        "ingestion_word_sync_results"
+    ]:
         if st.session_state.get(state_key):
             st.dataframe(pd.DataFrame(st.session_state[state_key]), use_container_width=True)
 
@@ -2412,16 +2884,24 @@ elif page == "🧪 データ取り込み検証":
         "5KBすべてが上記と同じChunking設定であることを確認しました",
         key="ingestion_chunking_confirmed"
     )
+    excel_chunking_confirmed = st.checkbox(
+        "Excel専用3KBが上記と同じChunking設定であることを確認しました",
+        key="ingestion_excel_chunking_confirmed"
+    )
+    word_chunking_confirmed = st.checkbox(
+        "Word専用3KBが上記と同じChunking設定であることを確認しました",
+        key="ingestion_word_chunking_confirmed"
+    )
 
-    def run_evaluation_group(formats, sync_state, config_state, output_state):
+    def run_evaluation_group(formats, sync_state, config_state, output_state, chunking_ok):
         subset = {key: ingestion_test_config[key] for key in formats}
         sync_results = st.session_state.get(sync_state, [])
-        full_config_errors = validate_ingestion_test_config(ingestion_bucket, ingestion_test_config)
-        if full_config_errors:
-            for message in full_config_errors:
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        if config_errors:
+            for message in config_errors:
                 st.error(message)
-        elif not chunking_confirmed:
-            st.error("5KBのChunking条件を確認してください。")
+        elif not chunking_ok:
+            st.error("対象KBのChunking条件を確認してください。")
         elif len(sync_results) != len(formats) or any(row["ステータス"] != "COMPLETE" for row in sync_results):
             st.error("対象Knowledge Baseの同期がすべてCOMPLETEではありません。")
         elif st.session_state.get(config_state) != subset:
@@ -2440,25 +2920,45 @@ elif page == "🧪 データ取り込み検証":
                 "timestamp": datetime.now().strftime("%Y%m%d%H%M%S")
             }
 
-    eval_col1, eval_col2 = st.columns(2)
+    eval_col1, eval_col2, eval_col3, eval_col4 = st.columns(4)
     if eval_col1.button("ファイルRetrieve比較を実行", type="primary", key="run_file_ingestion_evaluation"):
         try:
             run_evaluation_group(INGESTION_FILE_FORMATS, "ingestion_file_sync_results",
-                                 "ingestion_file_synced_config", "ingestion_file_evaluation")
+                                 "ingestion_file_synced_config", "ingestion_file_evaluation",
+                                 chunking_confirmed)
         except Exception as exc:
             st.error(f"ファイルRetrieve / 回答生成エラー: {exc}")
             st.code(traceback.format_exc())
     if eval_col2.button("Web Retrieve比較を実行", type="primary", key="run_web_ingestion_evaluation"):
         try:
             run_evaluation_group(INGESTION_WEB_FORMATS, "ingestion_web_sync_results",
-                                 "ingestion_web_synced_config", "ingestion_web_evaluation")
+                                 "ingestion_web_synced_config", "ingestion_web_evaluation",
+                                 chunking_confirmed)
         except Exception as exc:
             st.error(f"Web Retrieve / 回答生成エラー: {exc}")
+            st.code(traceback.format_exc())
+    if eval_col3.button("Excel Retrieve比較を実行", type="primary", key="run_excel_ingestion_evaluation"):
+        try:
+            run_evaluation_group(INGESTION_EXCEL_FORMATS, "ingestion_excel_sync_results",
+                                 "ingestion_excel_synced_config", "ingestion_excel_evaluation",
+                                 excel_chunking_confirmed)
+        except Exception as exc:
+            st.error(f"Excel Retrieve / 回答生成エラー: {exc}")
+            st.code(traceback.format_exc())
+    if eval_col4.button("Word Retrieve比較を実行", type="primary", key="run_word_ingestion_evaluation"):
+        try:
+            run_evaluation_group(INGESTION_WORD_FORMATS, "ingestion_word_sync_results",
+                                 "ingestion_word_synced_config", "ingestion_word_evaluation",
+                                 word_chunking_confirmed)
+        except Exception as exc:
+            st.error(f"Word Retrieve / 回答生成エラー: {exc}")
             st.code(traceback.format_exc())
 
     for evaluation_state, label, detail_prefix, comparison_prefix in [
         ("ingestion_file_evaluation", "ファイル", "ingestion_file_retrieval_detail", "ingestion_file_comparison"),
-        ("ingestion_web_evaluation", "Web", "ingestion_web_retrieval_detail", "ingestion_web_comparison")
+        ("ingestion_web_evaluation", "Web", "ingestion_web_retrieval_detail", "ingestion_web_comparison"),
+        ("ingestion_excel_evaluation", "Excel", "ingestion_excel_retrieval_detail", "ingestion_excel_comparison"),
+        ("ingestion_word_evaluation", "Word", "ingestion_word_retrieval_detail", "ingestion_word_comparison")
     ]:
         if not st.session_state.get(evaluation_state):
             continue

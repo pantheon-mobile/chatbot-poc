@@ -2,6 +2,7 @@ streamlit
 pandas
 boto3
 openpyxl
+python-docx
 pypdf
 requests
 beautifulsoup4

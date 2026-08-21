@@ -94,6 +94,18 @@ web_txt_knowledge_base_id = "YOUR_WEB_TXT_KB_ID"
 web_txt_data_source_id = "YOUR_WEB_TXT_DATA_SOURCE_ID"
 web_markdown_knowledge_base_id = "YOUR_WEB_MARKDOWN_KB_ID"
 web_markdown_data_source_id = "YOUR_WEB_MARKDOWN_DATA_SOURCE_ID"
+excel_xlsx_knowledge_base_id = "YOUR_EXCEL_XLSX_KB_ID"
+excel_xlsx_data_source_id = "YOUR_EXCEL_XLSX_DATA_SOURCE_ID"
+excel_csv_knowledge_base_id = "YOUR_EXCEL_CSV_KB_ID"
+excel_csv_data_source_id = "YOUR_EXCEL_CSV_DATA_SOURCE_ID"
+excel_markdown_knowledge_base_id = "YOUR_EXCEL_MARKDOWN_KB_ID"
+excel_markdown_data_source_id = "YOUR_EXCEL_MARKDOWN_DATA_SOURCE_ID"
+word_docx_knowledge_base_id = "YOUR_WORD_DOCX_KB_ID"
+word_docx_data_source_id = "YOUR_WORD_DOCX_DATA_SOURCE_ID"
+word_txt_knowledge_base_id = "YOUR_WORD_TXT_KB_ID"
+word_txt_data_source_id = "YOUR_WORD_TXT_DATA_SOURCE_ID"
+word_markdown_knowledge_base_id = "YOUR_WORD_MARKDOWN_KB_ID"
+word_markdown_data_source_id = "YOUR_WORD_MARKDOWN_DATA_SOURCE_ID"
 ```
 
 管理・追跡用正本は次の構成です。
@@ -111,14 +123,160 @@ FILE_TXT:      documents/ingestion-test/kb-source/file-txt/
 FILE_MARKDOWN: documents/ingestion-test/kb-source/file-markdown/
 WEB_TXT:       documents/ingestion-test/kb-source/web-txt/
 WEB_MARKDOWN:  documents/ingestion-test/kb-source/web-markdown/
+EXCEL_XLSX:    documents/ingestion-test/kb-source/excel-xlsx/
+EXCEL_CSV:     documents/ingestion-test/kb-source/excel-csv/
+EXCEL_MARKDOWN: documents/ingestion-test/kb-source/excel-markdown/
+WORD_DOCX:      documents/ingestion-test/kb-source/word-docx/
+WORD_TXT:       documents/ingestion-test/kb-source/word-txt/
+WORD_MARKDOWN:  documents/ingestion-test/kb-source/word-markdown/
 ```
 
-5つのData Sourceはすべて `Hierarchical Chunking`、Parent 1500 tokens、Child 300 tokens、
+各比較グループのData Sourceはすべて `Hierarchical Chunking`、Parent 1500 tokens、Child 300 tokens、
 Overlap 60 tokensに手動設定してください。画面上の確認チェックを入れない限り比較は実行できません。
 
-実行ユーザーには最低限、対象prefixへの `s3:PutObject` と既存確認用の `s3:GetObject`、
-対象5KB/Data Sourceへの `bedrock:StartIngestionJob`、`bedrock:GetIngestionJob`、
-`bedrock:Retrieve`、および回答モデルへの `bedrock:InvokeModel` が必要です。
+#### データ取り込み検証のIAM Action対応表
+
+| boto3 client | メソッド | IAM Action | Resource | 目的 |
+|---|---|---|---|---|
+| `boto3.client("s3")` | `head_object` | `s3:GetObject` | `arn:aws:s3:::<BUCKET>/documents/ingestion-test/*` | 上書き防止 |
+| `boto3.client("s3")` | `put_object` | `s3:PutObject` | `arn:aws:s3:::<BUCKET>/documents/ingestion-test/*` | 成果物配置 |
+| `boto3.client("bedrock-agent")` | `start_ingestion_job` | `bedrock:StartIngestionJob` | 検証用Knowledge Base ARN | 同期開始 |
+| `boto3.client("bedrock-agent")` | `get_ingestion_job` | `bedrock:GetIngestionJob` | 検証用Knowledge Base ARN | 同期状態取得 |
+| `boto3.client("bedrock-agent-runtime")` | `retrieve` | `bedrock:Retrieve` | 検証用Knowledge Base ARN | Retrieve評価 |
+| `boto3.client("bedrock-runtime")` | `converse` | `bedrock:InvokeModel` | Inference Profile ARNと配下Foundation Model ARN | 変換・回答生成 |
+| `boto3.client("bedrock-agent-runtime")` | `retrieve_and_generate` | `bedrock:RetrieveAndGenerate` | `*` | 既存チャット回答 |
+| `boto3.resource("dynamodb")` | `Table.put_item` | `dynamodb:PutItem` | `arn:aws:dynamodb:ap-northeast-1:<ACCOUNT_ID>:table/chatbot-feedback-table` | フィードバック保存 |
+| `boto3.resource("dynamodb")` | `Table.scan` | `dynamodb:Scan` | `arn:aws:dynamodb:ap-northeast-1:<ACCOUNT_ID>:table/chatbot-feedback-table` | フィードバックCSV出力 |
+
+PoC実行ロールの最小ポリシー例です。`<...>`は実リソースへ置き換え、KB ARNは検証用だけを列挙します。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IngestionTestObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::<BUCKET>/documents/ingestion-test/*"
+    },
+    {
+      "Sid": "TestKnowledgeBases",
+      "Effect": "Allow",
+      "Action": ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob", "bedrock:Retrieve"],
+      "Resource": ["arn:aws:bedrock:ap-northeast-1:<ACCOUNT_ID>:knowledge-base/<TEST_KB_ID>"]
+    },
+    {
+      "Sid": "ComparisonModel",
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": [
+        "arn:aws:bedrock:ap-northeast-1:<ACCOUNT_ID>:inference-profile/<PROFILE_ID>",
+        "arn:aws:bedrock:*::foundation-model/<FOUNDATION_MODEL_ID>"
+      ]
+    },
+    {
+      "Sid": "ExistingChatRetrieveAndGenerate",
+      "Effect": "Allow",
+      "Action": "bedrock:RetrieveAndGenerate",
+      "Resource": "*"
+    },
+    {
+      "Sid": "FeedbackTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:Scan"],
+      "Resource": "arn:aws:dynamodb:ap-northeast-1:<ACCOUNT_ID>:table/chatbot-feedback-table"
+    }
+  ]
+}
+```
+
+Knowledge Baseサービスロールの最小ポリシー例です。OpenSearch Serverless利用時の例であり、
+別のベクトルストアでは最後のStatementをそのサービス用権限へ置き換えます。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListSourcePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<BUCKET>",
+      "Condition": {"StringLike": {"s3:prefix": ["documents/ingestion-test/kb-source/*"]}}
+    },
+    {
+      "Sid": "ReadSourceObjects",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<BUCKET>/documents/ingestion-test/kb-source/*"
+    },
+    {
+      "Sid": "EmbeddingModel",
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": "arn:aws:bedrock:ap-northeast-1::foundation-model/<EMBEDDING_MODEL_ID>"
+    },
+    {
+      "Sid": "OpenSearchServerless",
+      "Effect": "Allow",
+      "Action": "aoss:APIAccessAll",
+      "Resource": "arn:aws:aoss:ap-northeast-1:<ACCOUNT_ID>:collection/<COLLECTION_ID>"
+    },
+    {
+      "Sid": "DecryptSourceObjectsIfKmsEncrypted",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:ap-northeast-1:<ACCOUNT_ID>:key/<KEY_ID>"
+    }
+  ]
+}
+```
+
+Knowledge Baseサービスロールの信頼ポリシーでは、Bedrockによる引き受けを次のように許可します。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"Service": "bedrock.amazonaws.com"},
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {"aws:SourceAccount": "<ACCOUNT_ID>"},
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:bedrock:ap-northeast-1:<ACCOUNT_ID>:knowledge-base/*"
+        }
+      }
+    }
+  ]
+}
+```
+
+OpenSearch Serverless側のデータアクセスポリシーにもKBサービスロールをPrincipalとして登録し、対象indexへ
+`aoss:CreateIndex`、`aoss:DescribeIndex`、`aoss:ReadDocument`、`aoss:WriteDocument`を付与します。
+SSE-KMSを使用しない場合は、上記JSONの`kms:Decrypt` Statementを削除します。
+
+この機能には`s3:DeleteObject`、`bedrock:DeleteKnowledgeBase`、`bedrock:DeleteDataSource`、
+`aoss:DeleteCollection`、`iam:*`は不要です。
+
+#### Excel取り込み比較
+
+`.xlsx`からXLSX原本、表示・非空シートごとのUTF-8 BOM付きCSV、Markdown表を生成します。
+非表示・空シートは除外し、Excel Table定義があればその範囲、なければ使用セル範囲を使います。
+数式は再計算せず、ファイルに保存された表示値を優先します。旧`.xls`、グラフ、画像、OCRは対象外です。
+
+管理用正本とKB同期用コピーは同じ`datasource_id`で紐付け、CSVとMarkdownにはシート単位の
+`document_part_id`を付けます。Excel専用3KBもHierarchical ChunkingのParent 1500、Child 300、
+Overlap 60 tokensへ手動設定し、画面で確認してから比較を実行してください。
+
+#### Word取り込み比較
+
+`.docx`からDOCX原本、構造付きTXT、Markdownを生成します。見出し、段落順、リスト、表、
+ハイパーリンク、改ページ、ヘッダー、フッターを可能な範囲で保持します。脚注、コメント、
+複雑なテキストボックス、埋め込み画像、旧`.doc`は対象外です。Word専用3KBも同じChunking条件へ
+手動設定し、画面で確認してから比較を実行してください。
 
 ### JASSO Q&A取得
 
