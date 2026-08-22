@@ -201,7 +201,7 @@ PDF先頭テキスト:
     attrs["source_file_name"] = file_name
     attrs["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    return metadata, response_text
+    return remove_empty_metadata_attributes(metadata), response_text
 
 
 # ==========================================
@@ -282,9 +282,20 @@ def generate_datasource_id() -> str:
     return f"DS_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
 
-def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
-                                       content, metadata: dict) -> str:
-    """PDF比較の1形式をPhase 1用prefixへ上書き保存し、保存先Keyを返す。"""
+def remove_empty_metadata_attributes(metadata: dict) -> dict:
+    """Bedrock KBで無効になる空属性をmetadataAttributesから除外する。"""
+    attributes = metadata.get("metadataAttributes", {})
+    metadata["metadataAttributes"] = {
+        key: value for key, value in attributes.items()
+        if value is not None
+        and not (isinstance(value, str) and not value.strip())
+        and not (isinstance(value, list) and not value)
+    }
+    return metadata
+
+
+def pdf_comparison_source_file_name(format_name: str, original_name: str) -> str:
+    """PDF比較形式に対応する、Phase 1用S3オブジェクトの実ファイル名を返す。"""
     source_name = os.path.basename((original_name or "source.pdf").replace("\\", "/"))
     source_stem = os.path.splitext(source_name)[0]
     file_names = {
@@ -294,7 +305,14 @@ def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
     }
     if format_name not in file_names:
         raise ValueError(f"未対応のPDF比較形式です: {format_name}")
-    key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{file_names[format_name]}"
+    return file_names[format_name]
+
+
+def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
+                                       content, metadata: dict) -> str:
+    """PDF比較の1形式をPhase 1用prefixへ上書き保存し、保存先Keyを返す。"""
+    file_name = pdf_comparison_source_file_name(format_name, original_name)
+    key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{file_name}"
     if not key.startswith("documents/ingestion-test/kb-source/"):
         raise ValueError("許可された検証prefix外のS3 Keyです。")
 
@@ -406,6 +424,7 @@ def build_excel_ingestion_artifacts(xlsx_bytes: bytes, original_name: str, datas
     xlsx_metadata["metadataAttributes"].update({
         **common_excel_metadata, "conversion_method": "original"
     })
+    remove_empty_metadata_attributes(xlsx_metadata)
     artifacts = []
 
     def add_pair(format_name: str, role: str, key: str, body: bytes, content_type: str, metadata: dict):
@@ -450,6 +469,7 @@ def build_excel_ingestion_artifacts(xlsx_bytes: bytes, original_name: str, datas
             metadata["metadataAttributes"].update({
                 **part_common, "conversion_method": conversion_method
             })
+            remove_empty_metadata_attributes(metadata)
             canonical_key = f"{root}processed/excel-{ingestion_format}/{file_name}"
             kb_key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{datasource_id}/{file_name}"
             add_pair(format_name, "管理用正本", canonical_key, body, content_type, metadata)
@@ -494,6 +514,7 @@ def build_word_ingestion_artifacts(docx_bytes: bytes, original_name: str, dataso
             datasource_id, original_name
         )
         metadata["metadataAttributes"].update({**common, "conversion_method": method})
+        remove_empty_metadata_attributes(metadata)
         metadata_by_format[format_name] = metadata
         folder = {"WORD_DOCX": "word-docx", "WORD_TXT": "word-txt", "WORD_MARKDOWN": "word-markdown"}[format_name]
         add_pair(format_name, "管理用正本", f"{root}processed/{folder}/{file_name}", body, content_type, metadata)
@@ -821,7 +842,7 @@ PDF抽出テキスト:
 def build_ingestion_metadata(source_type: str, ingestion_format: str, ui_metadata: dict,
                              source_url: str, source_file_name: str, original_title: str,
                              datasource_id: str, original_source_file_name: str = "") -> dict:
-    return {
+    return remove_empty_metadata_attributes({
         "metadataAttributes": {
             "datasource_id": datasource_id,
             "source_type": source_type,
@@ -838,7 +859,7 @@ def build_ingestion_metadata(source_type: str, ingestion_format: str, ui_metadat
             "original_title": original_title or "",
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-    }
+    })
 
 
 WEB_NOISE_SELECTORS = [
@@ -2274,7 +2295,8 @@ elif page == "🧪 データ取り込み検証":
                                 continue
                             metadata = build_ingestion_metadata(
                                 "pdf", format_name, ingestion_ui_metadata, pdf_source_url,
-                                file_name, original_title, datasource_id, original_name
+                                pdf_comparison_source_file_name(config_name, original_name),
+                                original_title, datasource_id, original_name
                             )
                             archive_name = f"{datasource_id}/{format_name}/{file_name}"
                             output_zip.writestr(archive_name, content)
