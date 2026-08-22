@@ -257,6 +257,10 @@ PDF_COMPARISON_BUCKET = "chat-bot-poc-plus"
 INGESTION_WEB_FORMATS = ("WEB_TXT", "WEB_MARKDOWN")
 INGESTION_EXCEL_FORMATS = ("EXCEL_XLSX", "EXCEL_CSV", "EXCEL_MARKDOWN")
 INGESTION_WORD_FORMATS = ("WORD_DOCX", "WORD_TXT", "WORD_MARKDOWN")
+INGESTION_ALL_FORMATS = (
+    *INGESTION_FILE_FORMATS, *INGESTION_WEB_FORMATS,
+    *INGESTION_EXCEL_FORMATS, *INGESTION_WORD_FORMATS
+)
 INGESTION_SYNC_SUCCESS_STATUSES = {"COMPLETE"}
 INGESTION_SYNC_FAILURE_STATUSES = {"FAILED", "STOPPED"}
 INGESTION_MANUAL_REVIEW_COLUMNS = [
@@ -649,12 +653,75 @@ def _retrieval_source(result: dict) -> tuple[str, str, str]:
     for value in location.values():
         if isinstance(value, dict):
             source_uri = value.get("uri") or value.get("url") or source_uri
-    metadata = result.get("metadata", {})
+    metadata = _retrieval_metadata(result)
     source_uri = source_uri or str(metadata.get("x-amz-bedrock-kb-source-uri", ""))
     uri_file = os.path.basename(urlparse(source_uri).path)
     source_file = str(metadata.get("source_file_name", "")).strip() or uri_file
     match_file = str(metadata.get("original_source_file_name", "")).strip() or source_file
     return source_uri, source_file, match_file
+
+
+def _retrieval_metadata(result: dict) -> dict:
+    """Retrieve結果のmetadataを表示・評価用のフラットなdictとして返す。"""
+    metadata = result.get("metadata", {}) or {}
+    nested = metadata.get("metadataAttributes")
+    if isinstance(nested, dict):
+        return {**metadata, **nested}
+    return metadata
+
+
+def retrieve_ingestion_chunks(question: str, knowledge_base_id: str, search_type: str,
+                              top_k: int, agent_runtime=None) -> tuple[list[dict], float]:
+    """既存比較と単発テストで共用するKnowledge Base Retrieve処理。"""
+    agent_runtime = agent_runtime or create_aws_client("bedrock-agent-runtime")
+    retrieval_started = time.perf_counter()
+    response = agent_runtime.retrieve(
+        knowledgeBaseId=knowledge_base_id, retrievalQuery={"text": question},
+        retrievalConfiguration={"vectorSearchConfiguration": {
+            "numberOfResults": top_k, "overrideSearchType": search_type
+        }}
+    )
+    retrieval_ms = round((time.perf_counter() - retrieval_started) * 1000, 1)
+    return response.get("retrievalResults", []), retrieval_ms
+
+
+def generate_ingestion_answer(question: str, retrieved: list[dict], model_id: str,
+                              max_tokens: int, runtime=None) -> tuple[str, float]:
+    """Retrieve済みチャンクだけをコンテキストにして回答を生成する。"""
+    runtime = runtime or create_bedrock_runtime_client()
+    combined_text = "\n\n".join(item.get("content", {}).get("text", "") for item in retrieved)
+    generation_started = time.perf_counter()
+    generated = runtime.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": INGESTION_ANSWER_PROMPT.format(
+            context=combined_text, question=question
+        )}]}],
+        inferenceConfig={"maxTokens": max_tokens, "temperature": 0}
+    )
+    generation_ms = round((time.perf_counter() - generation_started) * 1000, 1)
+    return generated["output"]["message"]["content"][0]["text"], generation_ms
+
+
+def retrieve_and_generate_ingestion_answer(question: str, values: dict, search_type: str,
+                                            top_k: int, model_id: str, max_tokens: int,
+                                            agent_runtime=None, runtime=None) -> dict:
+    """1つのKBをRetrieveし、その取得チャンクだけを使って回答を生成する。"""
+    total_started = time.perf_counter()
+    retrieved, retrieval_ms = retrieve_ingestion_chunks(
+        question, values["knowledge_base_id"], search_type, top_k, agent_runtime
+    )
+    combined_text = "\n\n".join(item.get("content", {}).get("text", "") for item in retrieved)
+    answer, generation_ms = generate_ingestion_answer(
+        question, retrieved, model_id, max_tokens, runtime
+    )
+    return {
+        "retrieval_results": retrieved,
+        "combined_text": combined_text,
+        "answer": answer,
+        "retrieval_elapsed_ms": retrieval_ms,
+        "generation_elapsed_ms": generation_ms,
+        "total_elapsed_ms": round((time.perf_counter() - total_started) * 1000, 1)
+    }
 
 
 def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_type: str,
@@ -672,15 +739,9 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
         keywords = [item.strip() for item in str(question_row.get("expected_keywords", "") or "").split(",") if item.strip()]
         for format_name, values in config.items():
             total_started = time.perf_counter()
-            retrieval_started = time.perf_counter()
-            response = agent_runtime.retrieve(
-                knowledgeBaseId=values["knowledge_base_id"], retrievalQuery={"text": question},
-                retrievalConfiguration={"vectorSearchConfiguration": {
-                    "numberOfResults": top_k, "overrideSearchType": search_type
-                }}
+            retrieved, retrieval_ms = retrieve_ingestion_chunks(
+                question, values["knowledge_base_id"], search_type, top_k, agent_runtime
             )
-            retrieval_ms = round((time.perf_counter() - retrieval_started) * 1000, 1)
-            retrieved = response.get("retrievalResults", [])
             combined_text = "\n\n".join(item.get("content", {}).get("text", "") for item in retrieved)
             source_hit_rank = None
             top_score = None
@@ -688,7 +749,7 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
             citations = []
             for rank, item in enumerate(retrieved, start=1):
                 source_uri, source_file, match_file = _retrieval_source(item)
-                item_metadata = item.get("metadata", {})
+                item_metadata = _retrieval_metadata(item)
                 if not retrieved_datasource_id:
                     retrieved_datasource_id = str(item_metadata.get("datasource_id", ""))
                 text_value = item.get("content", {}).get("text", "")
@@ -708,16 +769,9 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
                     "retrieval_elapsed_ms": retrieval_ms
                 })
             keyword_hits = sum(1 for keyword in keywords if keyword.lower() in combined_text.lower())
-            generation_started = time.perf_counter()
-            generated = runtime.converse(
-                modelId=model_id,
-                messages=[{"role": "user", "content": [{"text": INGESTION_ANSWER_PROMPT.format(
-                    context=combined_text, question=question
-                )}]}],
-                inferenceConfig={"maxTokens": max_tokens, "temperature": 0}
+            answer, generation_ms = generate_ingestion_answer(
+                question, retrieved, model_id, max_tokens, runtime
             )
-            generation_ms = round((time.perf_counter() - generation_started) * 1000, 1)
-            answer = generated["output"]["message"]["content"][0]["text"]
             comparison_rows.append({
                 "question": question, "ingestion_format": format_name,
                 "datasource_id": retrieved_datasource_id,
@@ -2923,7 +2977,125 @@ elif page == "🧪 データ取り込み検証":
         if st.session_state.get(state_key):
             st.dataframe(pd.DataFrame(st.session_state[state_key]), use_container_width=True)
 
-    st.subheader("3. 評価質問CSV")
+    st.subheader("3. 単発Retrieveテスト")
+    st.caption("ここで選択した検索・生成条件は、下の評価質問CSV比較でも共用します。")
+    setting_col1, setting_col2, setting_col3, setting_col4 = st.columns(4)
+    evaluation_search_type = setting_col1.selectbox(
+        "Search Type", ["HYBRID", "SEMANTIC"], key="ingestion_eval_search_type"
+    )
+    evaluation_top_k = setting_col2.selectbox(
+        "Top K", [3, 5, 10], index=1, key="ingestion_eval_top_k"
+    )
+    evaluation_model = setting_col3.text_input(
+        "回答モデル", value=CHAT_MODEL_ID, key="ingestion_eval_model"
+    )
+    evaluation_max_tokens = setting_col4.selectbox(
+        "Maximum Tokens", [1000, 2000, 4000], index=2, key="ingestion_eval_max_tokens"
+    )
+    single_question = st.text_area(
+        "質問", key="ingestion_single_retrieve_question",
+        placeholder="私立大学に自宅外通学する場合、第Ⅰ区分の給付奨学金はいくらですか？"
+    )
+    configured_formats = [
+        format_name for format_name in INGESTION_ALL_FORMATS
+        if ingestion_test_config.get(format_name, {}).get("knowledge_base_id", "").strip()
+        and not ingestion_test_config[format_name]["knowledge_base_id"].startswith("KB_ID_")
+    ]
+    single_formats = st.multiselect(
+        "対象方式",
+        list(INGESTION_ALL_FORMATS),
+        default=configured_formats,
+        key="ingestion_single_retrieve_formats",
+        help="初期状態ではKnowledge Base IDが入力済みの方式を選択しています。"
+    )
+
+    if st.button("単発Retrieveを実行", type="primary", key="run_single_ingestion_retrieve"):
+        if not single_question.strip():
+            st.error("質問を入力してください")
+        elif not single_formats:
+            st.error("対象方式を1つ以上選択してください。")
+        elif not evaluation_model.strip():
+            st.error("回答モデルを入力してください。")
+        else:
+            single_results = []
+            for format_name in single_formats:
+                values = ingestion_test_config.get(format_name, {})
+                kb_id = values.get("knowledge_base_id", "").strip()
+                base_result = {
+                    "format": format_name,
+                    "question": single_question.strip(),
+                    "search_type": evaluation_search_type,
+                    "top_k": evaluation_top_k,
+                    "knowledge_base_id": kb_id,
+                    "data_source_id": values.get("data_source_id", "").strip(),
+                    "error": ""
+                }
+                if not kb_id or kb_id.startswith("KB_ID_"):
+                    single_results.append({**base_result, "error": "Knowledge Base ID未設定"})
+                    continue
+                try:
+                    execution = retrieve_and_generate_ingestion_answer(
+                        single_question.strip(), values, evaluation_search_type,
+                        evaluation_top_k, evaluation_model.strip(), evaluation_max_tokens
+                    )
+                    single_results.append({**base_result, **execution})
+                except Exception as exc:
+                    single_results.append({**base_result, "error": str(exc)})
+            st.session_state.ingestion_single_retrieve_results = single_results
+
+    for single_result in st.session_state.get("ingestion_single_retrieve_results", []):
+        format_name = single_result["format"]
+        with st.expander(
+            f"{format_name} / "
+            f"{'エラー' if single_result.get('error') else str(len(single_result.get('retrieval_results', []))) + '件取得'}",
+            expanded=True
+        ):
+            st.write(f"質問: {single_result['question']}")
+            st.write(f"Search Type: {single_result['search_type']}")
+            st.write(f"Top K: {single_result['top_k']}")
+            st.write(f"Knowledge Base ID: {single_result.get('knowledge_base_id', '')}")
+            st.write(f"Data Source ID: {single_result.get('data_source_id', '')}")
+            if single_result.get("error"):
+                st.error(single_result["error"])
+                continue
+            retrieved_items = single_result.get("retrieval_results", [])
+            st.write(f"Retrieve件数: {len(retrieved_items)}")
+            st.write(f"Retrieve時間: {single_result['retrieval_elapsed_ms']} ms")
+            st.write(f"回答生成時間: {single_result['generation_elapsed_ms']} ms")
+            st.write(f"Total時間: {single_result['total_elapsed_ms']} ms")
+            st.markdown("**Retrieve結果**")
+            for rank, item in enumerate(retrieved_items, start=1):
+                metadata = _retrieval_metadata(item)
+                source_uri, source_file_name, _ = _retrieval_source(item)
+                with st.expander(
+                    f"{rank}位 / score={item.get('score', '')} / {source_file_name or source_uri or 'source不明'}"
+                ):
+                    st.write(f"順位: {rank}")
+                    st.write(f"Score: {item.get('score', '')}")
+                    if source_uri:
+                        st.write(f"Source URI / Location: {source_uri}")
+                    elif item.get("location"):
+                        st.write("Source Location:")
+                        st.json(item["location"])
+                    display_metadata = {
+                        key: value for key, value in {
+                            "source_file_name": source_file_name,
+                            "original_source_file_name": metadata.get("original_source_file_name"),
+                            "datasource_id": metadata.get("datasource_id"),
+                            "ingestion_format": metadata.get("ingestion_format"),
+                            "original_title": metadata.get("original_title"),
+                            "answer_source": metadata.get("answer_source"),
+                            "priority": metadata.get("priority")
+                        }.items() if value not in (None, "")
+                    }
+                    if display_metadata:
+                        st.json(display_metadata)
+                    st.markdown("**Chunk**")
+                    st.text(item.get("content", {}).get("text", ""))
+            st.markdown("**生成回答**")
+            st.write(single_result.get("answer", ""))
+
+    st.subheader("4. 評価質問CSV")
     evaluation_csv = st.file_uploader(
         "評価質問CSV", type=["csv"], key="ingestion_evaluation_csv",
         help="questionのみ必須。任意列: expected_source, expected_keywords, expected_answer, memo"
@@ -2952,18 +3124,6 @@ elif page == "🧪 データ取り込み検証":
         except Exception as exc:
             st.error(f"評価質問CSVの読み込みに失敗しました: {exc}")
             st.code(traceback.format_exc())
-
-    setting_col1, setting_col2, setting_col3, setting_col4 = st.columns(4)
-    evaluation_search_type = setting_col1.selectbox(
-        "Search Type", ["HYBRID", "SEMANTIC"], key="ingestion_eval_search_type"
-    )
-    evaluation_top_k = setting_col2.selectbox("Top K", [3, 5, 10], index=1, key="ingestion_eval_top_k")
-    evaluation_model = setting_col3.text_input(
-        "回答モデル", value=CHAT_MODEL_ID, key="ingestion_eval_model"
-    )
-    evaluation_max_tokens = setting_col4.selectbox(
-        "Maximum Tokens", [1000, 2000, 4000], index=2, key="ingestion_eval_max_tokens"
-    )
 
     st.info("比較前提: Hierarchical Chunking / Parent 1500 tokens / Child 300 tokens / Overlap 60 tokens")
     chunking_confirmed = st.checkbox(
