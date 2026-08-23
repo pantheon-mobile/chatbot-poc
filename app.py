@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from jasso_crawler import JassoCrawler
@@ -243,6 +243,7 @@ INGESTION_TEST_KB_PREFIXES = {
     "FILE_PDF": "documents/ingestion-test/kb-source/file-pdf/",
     "FILE_TXT": "documents/ingestion-test/kb-source/file-txt/",
     "FILE_MARKDOWN": "documents/ingestion-test/kb-source/file-markdown/",
+    "FILE_VISION_MARKDOWN": "documents/ingestion-test/kb-source/file-vision-markdown/",
     "WEB_TXT": "documents/ingestion-test/kb-source/web-txt/",
     "WEB_MARKDOWN": "documents/ingestion-test/kb-source/web-markdown/",
     "EXCEL_XLSX": "documents/ingestion-test/kb-source/excel-xlsx/",
@@ -252,7 +253,7 @@ INGESTION_TEST_KB_PREFIXES = {
     "WORD_TXT": "documents/ingestion-test/kb-source/word-txt/",
     "WORD_MARKDOWN": "documents/ingestion-test/kb-source/word-markdown/",
 }
-INGESTION_FILE_FORMATS = ("FILE_PDF", "FILE_TXT", "FILE_MARKDOWN")
+INGESTION_FILE_FORMATS = ("FILE_PDF", "FILE_TXT", "FILE_MARKDOWN", "FILE_VISION_MARKDOWN")
 PDF_COMPARISON_BUCKET = "chat-bot-poc-plus"
 INGESTION_WEB_FORMATS = ("WEB_TXT", "WEB_MARKDOWN")
 INGESTION_EXCEL_FORMATS = ("EXCEL_XLSX", "EXCEL_CSV", "EXCEL_MARKDOWN")
@@ -306,6 +307,7 @@ def pdf_comparison_source_file_name(format_name: str, original_name: str) -> str
         "FILE_PDF": source_name,
         "FILE_TXT": f"{source_stem}.txt",
         "FILE_MARKDOWN": f"{source_stem}.md",
+        "FILE_VISION_MARKDOWN": f"{source_stem}.md",
     }
     if format_name not in file_names:
         raise ValueError(f"未対応のPDF比較形式です: {format_name}")
@@ -324,6 +326,7 @@ def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
         "FILE_PDF": "application/pdf",
         "FILE_TXT": "text/plain; charset=utf-8",
         "FILE_MARKDOWN": "text/markdown; charset=utf-8",
+        "FILE_VISION_MARKDOWN": "text/markdown; charset=utf-8",
     }
     body = content if isinstance(content, bytes) else content.encode("utf-8")
     s3 = create_aws_client("s3")
@@ -364,7 +367,7 @@ def validate_ingestion_test_config(bucket: str, config: dict) -> list[str]:
             errors.append(f"{format_name}のData Source IDが未設定です。")
         kb_ids.append(kb_id)
     if len([item for item in kb_ids if item]) != len(set(item for item in kb_ids if item)):
-        errors.append("5方式にはそれぞれ別のKnowledge Base IDを指定してください。")
+        errors.append("対象方式にはそれぞれ別のKnowledge Base IDを指定してください。")
     return errors
 
 
@@ -387,6 +390,7 @@ def build_ingestion_s3_artifacts(datasource_id: str, source_type: str, formats: 
         "FILE_PDF": ("pdf", "source.pdf", "application/pdf"),
         "FILE_TXT": ("txt", "source.txt", "text/plain; charset=utf-8"),
         "FILE_MARKDOWN": ("markdown", "source.md", "text/markdown; charset=utf-8"),
+        "FILE_VISION_MARKDOWN": ("vision-markdown", "source.md", "text/markdown; charset=utf-8"),
         "WEB_TXT": ("web-txt", "page.txt", "text/plain; charset=utf-8"),
         "WEB_MARKDOWN": ("web-markdown", "page.md", "text/markdown; charset=utf-8"),
     }
@@ -891,6 +895,83 @@ PDF抽出テキスト:
         part = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", part, flags=re.IGNORECASE)
         markdown_parts.append(part)
     return "\n\n".join(markdown_parts).strip()
+
+
+VISION_MARKDOWN_PROMPT = """このPDFページを、人間がページを見たときの視覚構造に基づいて、
+RAG検索に適した忠実なMarkdownへ変換してください。要約ではありません。
+
+厳守事項:
+- 原文の情報を要約、省略、追加、推測しない
+- 見出し階層、箇条書き、注記、脚注、条件分岐、URLを保持する
+- 表は可能な限りMarkdown tableとして復元する
+- 表の行見出し、列見出し、結合見出しと各セル値の意味関係を保持する
+- セルを単に読み上げず、各数値が属する行見出しと列見出しを絶対に崩さない
+- 金額、日付、割合、固有名詞、条件を改変しない
+- ページをまたぐ表や説明は、与えられた直前文脈との意味関係を維持する
+- OCR的に不確実な文字を推測で補完せず、不確実であることを明示する
+- 図表内のRAG上重要な文字情報はMarkdownへ反映する
+- 装飾目的だけの画像は無理に文章化しない
+- 各ページ境界を `<!-- page N -->` として残す
+- Markdown本文だけを返し、コードフェンスや前置きを付けない
+
+対象ページ: {page_start}〜{page_end} / 全{page_count}ページ
+直前バッチの構造文脈（初回は「なし」）:
+{previous_context}
+"""
+
+
+def convert_pdf_to_vision_markdown(pdf_bytes: bytes, model_id: str,
+                                   pages_per_batch: int = 3) -> tuple[str, dict]:
+    """PDFを数ページずつConverseのdocument入力へ渡し、視覚構造をMarkdown化する。"""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    page_count = len(reader.pages)
+    if page_count == 0:
+        raise ValueError("PDFにページがありません。")
+    runtime = create_bedrock_runtime_client()
+    outputs, batch_metrics = [], []
+    total_started = time.perf_counter()
+    for batch_index, page_start_zero in enumerate(range(0, page_count, pages_per_batch), start=1):
+        page_end_zero = min(page_start_zero + pages_per_batch, page_count)
+        writer = PdfWriter()
+        for page_index in range(page_start_zero, page_end_zero):
+            writer.add_page(reader.pages[page_index])
+        batch_buffer = io.BytesIO()
+        writer.write(batch_buffer)
+        previous_context = outputs[-1][-1500:] if outputs else "なし"
+        prompt = VISION_MARKDOWN_PROMPT.format(
+            page_start=page_start_zero + 1,
+            page_end=page_end_zero,
+            page_count=page_count,
+            previous_context=previous_context
+        )
+        batch_started = time.perf_counter()
+        response = runtime.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [
+                {"document": {
+                    "format": "pdf",
+                    "name": f"pdf-pages-{page_start_zero + 1}-{page_end_zero}",
+                    "source": {"bytes": batch_buffer.getvalue()}
+                }},
+                {"text": prompt}
+            ]}],
+            inferenceConfig={"maxTokens": 8000, "temperature": 0}
+        )
+        markdown = response["output"]["message"]["content"][0]["text"].strip()
+        markdown = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", markdown, flags=re.IGNORECASE)
+        outputs.append(markdown)
+        batch_metrics.append({
+            "batch": batch_index,
+            "page_start": page_start_zero + 1,
+            "page_end": page_end_zero,
+            "elapsed_ms": round((time.perf_counter() - batch_started) * 1000, 1)
+        })
+    return "\n\n".join(outputs).strip(), {
+        "page_count": page_count,
+        "pages_per_batch": pages_per_batch,
+        "batch_metrics": batch_metrics,
+        "total_elapsed_ms": round((time.perf_counter() - total_started) * 1000, 1)
+    }
 
 
 def build_ingestion_metadata(source_type: str, ingestion_format: str, ui_metadata: dict,
@@ -2245,8 +2326,8 @@ elif page == "🧾 PDFメタデータ生成":
 # ==========================================
 elif page == "🧪 データ取り込み検証":
     st.title("🧪 データ取り込み検証")
-    st.write("PDF原本・TXT・Markdown、またはWeb本文のTXT・Markdownを生成し、投入形式を比較します。")
-    st.caption("生成後、検証専用prefixへのS3配置・3つの検証専用Knowledge Base同期・同条件評価まで実行できます。")
+    st.write("PDF原本・TXT・Markdown・Vision Markdown、またはWeb本文のTXT・Markdownを生成し、投入形式を比較します。")
+    st.caption("生成後、検証専用prefixへのS3配置・検証専用Knowledge Base同期・同条件評価まで実行できます。")
 
     st.subheader("共通metadata")
     meta_col1, meta_col2 = st.columns(2)
@@ -2282,10 +2363,13 @@ elif page == "🧪 データ取り込み検証":
             "PDFファイル（複数選択可）", type=["pdf"], accept_multiple_files=True,
             key="ingestion_pdf_uploads"
         )
-        format_col1, format_col2, format_col3 = st.columns(3)
+        format_col1, format_col2, format_col3, format_col4 = st.columns(4)
         include_pdf = format_col1.checkbox("PDF原本", value=True, key="include_original_pdf")
         include_txt = format_col2.checkbox("TXT", value=True, key="include_pdf_txt")
         include_markdown = format_col3.checkbox("Markdown（Claude Sonnet）", value=True, key="include_pdf_md")
+        include_vision_markdown = format_col4.checkbox(
+            "Vision Markdown（Claude Sonnet）", value=False, key="include_pdf_vision_md"
+        )
         pdf_source_url = st.text_input("元URL（任意）", key="ingestion_pdf_source_url")
         markdown_model_id = st.text_input(
             "Markdown整形モデルID", value=CHAT_MODEL_ID, key="ingestion_markdown_model"
@@ -2300,7 +2384,7 @@ elif page == "🧪 データ取り込み検証":
         if st.button("PDF変換を実行", type="primary", key="run_pdf_ingestion"):
             if not pdf_uploads:
                 st.error("PDFファイルを1件以上アップロードしてください。")
-            elif not any([include_pdf, include_txt, include_markdown]):
+            elif not any([include_pdf, include_txt, include_markdown, include_vision_markdown]):
                 st.error("生成形式を1つ以上選択してください。")
             else:
                 zip_buffer, results, previews, artifacts = io.BytesIO(), [], [], []
@@ -2318,8 +2402,15 @@ elif page == "🧪 データ取り込み検証":
                             except Exception as exc:
                                 extraction_error = str(exc)
                             extraction_ms = round((time.perf_counter() - extraction_started) * 1000, 1)
+                        if include_vision_markdown and not original_title:
+                            try:
+                                pdf_metadata = PdfReader(io.BytesIO(pdf_bytes)).metadata
+                                original_title = str((pdf_metadata or {}).get("/Title") or "").strip()
+                            except Exception:
+                                pass
 
-                        selected_formats, markdown_ms = [], 0.0
+                        selected_formats, markdown_ms, vision_markdown_ms = [], 0.0, 0.0
+                        vision_metrics = {}
                         if include_pdf:
                             selected_formats.append(("FILE_PDF", "pdf", "source.pdf", pdf_bytes, None, 0.0))
                         if include_txt:
@@ -2336,6 +2427,23 @@ elif page == "🧪 データ取り込み検証":
                                 except Exception as exc:
                                     markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
                                     selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", "", str(exc), extraction_ms + markdown_ms))
+                        if include_vision_markdown:
+                            vision_started = time.perf_counter()
+                            try:
+                                vision_markdown_text, vision_metrics = convert_pdf_to_vision_markdown(
+                                    pdf_bytes, markdown_model_id
+                                )
+                                vision_markdown_ms = round((time.perf_counter() - vision_started) * 1000, 1)
+                                selected_formats.append((
+                                    "FILE_VISION_MARKDOWN", "vision_markdown", "source.md",
+                                    vision_markdown_text, None, vision_markdown_ms
+                                ))
+                            except Exception as exc:
+                                vision_markdown_ms = round((time.perf_counter() - vision_started) * 1000, 1)
+                                selected_formats.append((
+                                    "FILE_VISION_MARKDOWN", "vision_markdown", "source.md",
+                                    "", str(exc), vision_markdown_ms
+                                ))
 
                         successful_formats, metadata_by_format = {}, {}
                         for config_name, format_name, file_name, content, error, conversion_ms in selected_formats:
@@ -2343,7 +2451,11 @@ elif page == "🧪 データ取り込み検証":
                                 results.append({
                                     "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
                                     "生成形式": config_name, "文字数": 0, "PDF抽出時間(ms)": extraction_ms,
-                                    "Markdown変換時間(ms)": markdown_ms, "変換時間(ms)": conversion_ms,
+                                    "Markdown変換時間(ms)": markdown_ms,
+                                    "Vision Markdown変換時間(ms)": (
+                                        vision_markdown_ms if config_name == "FILE_VISION_MARKDOWN" else 0
+                                    ),
+                                    "変換時間(ms)": conversion_ms,
                                     "結果": "失敗", "エラー内容": error
                                 })
                                 continue
@@ -2369,6 +2481,9 @@ elif page == "🧪 データ取り込み検証":
                                     "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
                                     "生成形式": config_name, "文字数": char_count,
                                     "PDF抽出時間(ms)": extraction_ms, "Markdown変換時間(ms)": markdown_ms,
+                                    "Vision Markdown変換時間(ms)": (
+                                        vision_markdown_ms if config_name == "FILE_VISION_MARKDOWN" else 0
+                                    ),
                                     "変換時間(ms)": conversion_ms, "結果": "失敗",
                                     "エラー内容": f"S3保存エラー: {exc}"
                                 })
@@ -2376,19 +2491,31 @@ elif page == "🧪 データ取り込み検証":
                                     "datasource_id": datasource_id, "source": original_name,
                                     "format": config_name, "count": char_count,
                                     "metadata": metadata,
-                                    "text": content[:5000] if isinstance(content, str) else ""
+                                    "text": (
+                                        content[:20000] if config_name == "FILE_VISION_MARKDOWN"
+                                        else content[:5000]
+                                    ) if isinstance(content, str) else "",
+                                    "vision_metrics": vision_metrics if config_name == "FILE_VISION_MARKDOWN" else {}
                                 })
                                 continue
                             results.append({
                                 "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
                                 "生成形式": config_name, "文字数": char_count,
                                 "PDF抽出時間(ms)": extraction_ms, "Markdown変換時間(ms)": markdown_ms,
+                                "Vision Markdown変換時間(ms)": (
+                                    vision_markdown_ms if config_name == "FILE_VISION_MARKDOWN" else 0
+                                ),
                                 "変換時間(ms)": conversion_ms, "結果": "成功", "エラー内容": ""
                             })
                             previews.append({
                                 "datasource_id": datasource_id, "source": original_name,
                                 "format": config_name, "count": char_count,
-                                "metadata": metadata, "text": content[:5000] if isinstance(content, str) else ""
+                                "metadata": metadata,
+                                "text": (
+                                    content[:20000] if config_name == "FILE_VISION_MARKDOWN"
+                                    else content[:5000]
+                                ) if isinstance(content, str) else "",
+                                "vision_metrics": vision_metrics if config_name == "FILE_VISION_MARKDOWN" else {}
                             })
                             successful_formats[config_name] = content
                             metadata_by_format[config_name] = metadata
@@ -2416,8 +2543,17 @@ elif page == "🧪 データ取り込み検証":
             for preview in pdf_output["previews"]:
                 with st.expander(f"✅ {preview['datasource_id']} / {preview['source']} / {preview['format']} / {preview['count']}文字"):
                     st.json(preview["metadata"])
+                    if preview.get("vision_metrics"):
+                        st.json({
+                            key: value for key, value in preview["vision_metrics"].items()
+                            if key != "batch_metrics"
+                        })
+                        st.dataframe(
+                            pd.DataFrame(preview["vision_metrics"].get("batch_metrics", [])),
+                            use_container_width=True
+                        )
                     if preview["text"]:
-                        if preview["format"] == "FILE_MARKDOWN":
+                        if preview["format"] in {"FILE_MARKDOWN", "FILE_VISION_MARKDOWN"}:
                             st.markdown(preview["text"])
                         else:
                             st.text(preview["text"])
@@ -2739,7 +2875,7 @@ elif page == "🧪 データ取り込み検証":
             )
 
     st.divider()
-    st.header("PDF 3方式 / Web 2方式 / Excel 3方式 / Word 3方式 RAG比較")
+    st.header("PDF 4方式 / Web 2方式 / Excel 3方式 / Word 3方式 RAG比較")
     st.warning(
         "ここでは検証専用KBだけを指定してください。KB/Data Sourceの作成・削除や、"
         "S3既存オブジェクトの上書きは行いません。"
@@ -2750,7 +2886,7 @@ elif page == "🧪 データ取り込み検証":
         "S3バケット", value=default_bucket, key="ingestion_test_bucket",
         help="既存PoCで利用しているバケット名。Secretsの ingestion_test.s3_bucket または aws.s3_bucket を初期値に使います。"
     )
-    config_columns = st.columns(5)
+    config_columns = st.columns(len(INGESTION_FILE_FORMATS) + len(INGESTION_WEB_FORMATS))
     ingestion_test_config = {}
     for column, format_name in zip(config_columns, [*INGESTION_FILE_FORMATS, *INGESTION_WEB_FORMATS]):
         secret_prefix = format_name.lower()
@@ -2812,16 +2948,13 @@ elif page == "🧪 データ取り込み検証":
     if upload_col1.button("ファイル成果物をS3へアップロード", key="upload_file_ingestion_to_s3"):
         for stale_key in ["ingestion_file_upload_results", "ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
             st.session_state.pop(stale_key, None)
-        subset = {key: ingestion_test_config[key] for key in INGESTION_FILE_FORMATS}
-        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
         output = st.session_state.get("ingestion_pdf_output")
-        if config_errors:
-            for message in config_errors:
-                st.error(message)
+        if not ingestion_bucket.strip():
+            st.error("S3バケット名が未設定です。")
         elif (not output or not output.get("artifacts")
               or {row["生成形式"] for row in output["results"]} != set(INGESTION_FILE_FORMATS)
               or any(row["結果"] != "成功" for row in output["results"])):
-            st.error("PDF/TXT/Markdownがすべて成功した変換結果を先に作成してください。")
+            st.error("PDF/TXT/Markdown/Vision Markdownがすべて成功した変換結果を先に作成してください。")
         else:
             try:
                 st.session_state.ingestion_file_upload_results = upload_ingestion_artifacts_to_s3(
@@ -2910,7 +3043,7 @@ elif page == "🧪 データ取り込み検証":
         "同期タイムアウト（秒）", min_value=60, max_value=7200, value=1800, step=60,
         key="ingestion_sync_timeout"
     )
-    def run_sync_group(formats, upload_state, sync_state, config_state):
+    def run_sync_group(formats, upload_state, sync_state, config_state, conversion_output_state=""):
         subset = {key: ingestion_test_config[key] for key in formats}
         config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
         upload_results = st.session_state.get(upload_state, [])
@@ -2918,7 +3051,14 @@ elif page == "🧪 データ取り込み検証":
             for message in config_errors:
                 st.error(message)
             return
-        if not upload_results or any(row["アップロード結果"] != "成功" for row in upload_results):
+        if conversion_output_state:
+            conversion_rows = st.session_state.get(conversion_output_state, {}).get("results", [])
+            for format_name in formats:
+                format_rows = [row for row in conversion_rows if row.get("生成形式") == format_name]
+                if not format_rows or any(row.get("結果") != "成功" for row in format_rows):
+                    st.error(f"{format_name}のS3保存が成功してから同期してください。")
+                    return
+        elif not upload_results or any(row["アップロード結果"] != "成功" for row in upload_results):
             st.error("対象成果物のS3アップロードがすべて成功してから同期してください。")
             return
         status_box = st.empty()
@@ -2934,12 +3074,25 @@ elif page == "🧪 データ取り込み検証":
         st.session_state[config_state] = json.loads(json.dumps(subset))
 
     sync_col1, sync_col2, sync_col3, sync_col4 = st.columns(4)
-    if sync_col1.button("ファイル3KBを同期", key="sync_file_ingestion_kbs"):
+    if sync_col1.button("PDF 4KBを同期", key="sync_file_ingestion_kbs"):
         for stale_key in ["ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
             st.session_state.pop(stale_key, None)
         try:
-            run_sync_group(INGESTION_FILE_FORMATS, "ingestion_file_upload_results",
-                           "ingestion_file_sync_results", "ingestion_file_synced_config")
+            configured_formats = []
+            for format_name in INGESTION_FILE_FORMATS:
+                values = ingestion_test_config[format_name]
+                if (values["knowledge_base_id"] and values["data_source_id"]
+                        and not values["knowledge_base_id"].startswith("KB_ID_")
+                        and not values["data_source_id"].startswith("DATA_SOURCE_ID_")):
+                    configured_formats.append(format_name)
+                else:
+                    st.warning(f"{format_name}: Knowledge Base ID / Data Source ID未設定のためスキップ")
+            if not configured_formats:
+                st.error("同期可能なPDF比較用KB設定がありません。")
+            else:
+                run_sync_group(configured_formats, "ingestion_file_upload_results",
+                               "ingestion_file_sync_results", "ingestion_file_synced_config",
+                               conversion_output_state="ingestion_pdf_output")
         except Exception as exc:
             st.error(f"ファイルKnowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
@@ -3127,7 +3280,7 @@ elif page == "🧪 データ取り込み検証":
 
     st.info("比較前提: Hierarchical Chunking / Parent 1500 tokens / Child 300 tokens / Overlap 60 tokens")
     chunking_confirmed = st.checkbox(
-        "5KBすべてが上記と同じChunking設定であることを確認しました",
+        "PDF 4KB / Web 2KBが上記と同じChunking設定であることを確認しました",
         key="ingestion_chunking_confirmed"
     )
     excel_chunking_confirmed = st.checkbox(
