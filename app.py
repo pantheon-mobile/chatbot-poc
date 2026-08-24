@@ -317,6 +317,20 @@ def pdf_comparison_source_file_name(format_name: str, original_name: str) -> str
 def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
                                        content, metadata: dict) -> str:
     """PDF比較の1形式をPhase 1用prefixへ上書き保存し、保存先Keyを返す。"""
+    artifacts = build_pdf_comparison_s3_artifacts(
+        format_name, original_name, content, metadata,
+        metadata.get("metadataAttributes", {}).get("datasource_id", "")
+    )
+    rows = upload_selected_pdf_artifacts_to_s3(artifacts, [format_name])
+    if not rows or rows[0]["総合結果"] != "成功":
+        raise RuntimeError(rows[0]["エラー内容"] if rows else "S3アップロード結果を取得できませんでした。")
+    return rows[0]["S3本体Key"]
+
+
+def build_pdf_comparison_s3_artifacts(format_name: str, original_name: str,
+                                      content, metadata: dict,
+                                      datasource_id: str = "") -> list[dict]:
+    """PDF比較1方式の本文とBedrock sidecarを明示的な方式情報付きで生成する。"""
     file_name = pdf_comparison_source_file_name(format_name, original_name)
     key = f"{INGESTION_TEST_KB_PREFIXES[format_name]}{file_name}"
     if not key.startswith("documents/ingestion-test/kb-source/"):
@@ -329,20 +343,70 @@ def upload_pdf_comparison_format_to_s3(format_name: str, original_name: str,
         "FILE_VISION_MARKDOWN": "text/markdown; charset=utf-8",
     }
     body = content if isinstance(content, bytes) else content.encode("utf-8")
+    metadata_body = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+    common = {
+        "datasource_id": datasource_id, "format": format_name,
+        "source_file_name": file_name
+    }
+    return [
+        {**common, "artifact_type": "body", "key": key, "body": body,
+         "content_type": content_types[format_name]},
+        {**common, "artifact_type": "metadata", "key": f"{key}.metadata.json",
+         "body": metadata_body, "content_type": "application/json"},
+    ]
+
+
+def upload_selected_pdf_artifacts_to_s3(artifacts: list[dict], selected_formats,
+                                        bucket: str = PDF_COMPARISON_BUCKET) -> list[dict]:
+    """選択したPDF比較方式だけを本文・metadataペア単位でS3へ上書きする。"""
+    selected = set(selected_formats)
+    grouped = {}
+    for artifact in artifacts:
+        format_name = artifact.get("format")
+        if format_name not in selected:
+            continue
+        group_key = (artifact.get("datasource_id", ""), format_name)
+        grouped.setdefault(group_key, {})[artifact.get("artifact_type")] = artifact
+
     s3 = create_aws_client("s3")
-    s3.put_object(
-        Bucket=PDF_COMPARISON_BUCKET,
-        Key=key,
-        Body=body,
-        ContentType=content_types[format_name]
-    )
-    s3.put_object(
-        Bucket=PDF_COMPARISON_BUCKET,
-        Key=f"{key}.metadata.json",
-        Body=json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
-        ContentType="application/json"
-    )
-    return key
+    rows = []
+    for (datasource_id, format_name), pair in grouped.items():
+        body_artifact, metadata_artifact = pair.get("body"), pair.get("metadata")
+        row = {
+            "datasource_id": datasource_id, "生成形式": format_name,
+            "S3本体Key": body_artifact.get("key", "") if body_artifact else "",
+            "metadata Key": metadata_artifact.get("key", "") if metadata_artifact else "",
+            "本体アップロード結果": "未実行", "metadataアップロード結果": "未実行",
+            "総合結果": "失敗", "エラー内容": ""
+        }
+        errors = []
+        for artifact_type, result_key, label in (
+            ("body", "本体アップロード結果", "本体"),
+            ("metadata", "metadataアップロード結果", "metadata")
+        ):
+            artifact = pair.get(artifact_type)
+            if not artifact:
+                errors.append(f"{label}成果物がありません。")
+                continue
+            try:
+                key = artifact["key"]
+                if (not key.startswith("documents/ingestion-test/kb-source/")
+                        or ".." in key.split("/")):
+                    raise ValueError("許可された検証prefix外のS3 Keyです。")
+                s3.put_object(
+                    Bucket=bucket, Key=key, Body=artifact["body"],
+                    ContentType=artifact["content_type"]
+                )
+                row[result_key] = "成功"
+            except Exception as exc:
+                row[result_key] = "失敗"
+                errors.append(f"{label}: {exc}")
+        if (row["本体アップロード結果"] == "成功"
+                and row["metadataアップロード結果"] == "成功"):
+            row["総合結果"] = "成功"
+        row["エラー内容"] = " / ".join(errors)
+        rows.append(row)
+    return rows
 
 
 def _setting(section: str, key: str, default: str = "") -> str:
@@ -2759,6 +2823,7 @@ elif page == "🧪 データ取り込み検証":
                 st.error("生成形式を1つ以上選択してください。")
             else:
                 zip_buffer, results, previews, artifacts = io.BytesIO(), [], [], []
+                pdf_s3_artifacts = []
                 progress = st.progress(0)
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
                     for pdf_index, uploaded_pdf in enumerate(pdf_uploads, start=1):
@@ -2853,10 +2918,19 @@ elif page == "🧪 データ取り込み検証":
                             )
                             # PDFはバイナリなので、比較表示では抽出可能な本文の文字数を使う。
                             char_count = len(content) if isinstance(content, str) else len(pdf_text)
+                            format_s3_artifacts = build_pdf_comparison_s3_artifacts(
+                                config_name, original_name, content, metadata, datasource_id
+                            )
+                            pdf_s3_artifacts.extend(format_s3_artifacts)
                             try:
-                                upload_pdf_comparison_format_to_s3(
-                                    config_name, original_name, content, metadata
+                                upload_rows = upload_selected_pdf_artifacts_to_s3(
+                                    format_s3_artifacts, [config_name]
                                 )
+                                if not upload_rows or upload_rows[0]["総合結果"] != "成功":
+                                    raise RuntimeError(
+                                        upload_rows[0]["エラー内容"] if upload_rows
+                                        else "S3アップロード結果を取得できませんでした。"
+                                    )
                             except Exception as exc:
                                 results.append({
                                     "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
@@ -2911,14 +2985,9 @@ elif page == "🧪 データ取り込み検証":
                         progress.progress(pdf_index / len(pdf_uploads))
                 st.session_state.ingestion_pdf_output = {
                     "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
-                    "artifacts": artifacts,
+                    "artifacts": artifacts, "pdf_s3_artifacts": pdf_s3_artifacts,
                     "filename": datetime.now().strftime("ingestion_test_%Y%m%d%H%M%S.zip")
                 }
-                for stale_key in [
-                    "ingestion_file_upload_results", "ingestion_file_sync_results",
-                    "ingestion_file_synced_config", "ingestion_file_evaluation"
-                ]:
-                    st.session_state.pop(stale_key, None)
 
         if "ingestion_pdf_output" in st.session_state:
             pdf_output = st.session_state.ingestion_pdf_output
@@ -3340,22 +3409,44 @@ elif page == "🧪 データ取り込み検証":
     st.code("\n".join(f"{name}: {prefix}" for name, prefix in INGESTION_TEST_KB_PREFIXES.items()))
 
     st.subheader("1. S3へ二重配置")
+    pdf_upload_output = st.session_state.get("ingestion_pdf_output", {})
+    pdf_upload_artifacts = pdf_upload_output.get("pdf_s3_artifacts", [])
+    available_pdf_upload_formats = [
+        format_name for format_name in INGESTION_FILE_FORMATS
+        if any(item.get("format") == format_name for item in pdf_upload_artifacts)
+    ]
+    if "ingestion_selected_pdf_upload_formats" in st.session_state:
+        st.session_state.ingestion_selected_pdf_upload_formats = [
+            item for item in st.session_state.ingestion_selected_pdf_upload_formats
+            if item in available_pdf_upload_formats
+        ]
+    selected_pdf_upload_formats = st.multiselect(
+        "S3へアップロードするPDF比較方式",
+        options=available_pdf_upload_formats,
+        default=available_pdf_upload_formats,
+        key="ingestion_selected_pdf_upload_formats"
+    )
     upload_col1, upload_col2, upload_col3, upload_col4 = st.columns(4)
-    if upload_col1.button("ファイル成果物をS3へアップロード", key="upload_file_ingestion_to_s3"):
-        for stale_key in ["ingestion_file_upload_results", "ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
-            st.session_state.pop(stale_key, None)
-        output = st.session_state.get("ingestion_pdf_output")
-        if not ingestion_bucket.strip():
-            st.error("S3バケット名が未設定です。")
-        elif (not output or not output.get("artifacts")
-              or {row["生成形式"] for row in output["results"]} != set(INGESTION_FILE_FORMATS)
-              or any(row["結果"] != "成功" for row in output["results"])):
-            st.error("PDF/TXT/Markdown/Vision Markdownがすべて成功した変換結果を先に作成してください。")
+    if upload_col1.button("選択したファイル成果物をS3へアップロード", key="upload_file_ingestion_to_s3"):
+        if not available_pdf_upload_formats:
+            st.error("S3へアップロード可能な成功成果物がありません。")
+        elif not selected_pdf_upload_formats:
+            st.error("S3へアップロードするPDF比較方式を1つ以上選択してください。")
+        elif not pdf_upload_artifacts:
+            st.error("選択方式の変換成功結果を先に作成してください。")
         else:
             try:
-                st.session_state.ingestion_file_upload_results = upload_ingestion_artifacts_to_s3(
-                    output["artifacts"], ingestion_bucket.strip(), "PDF"
+                upload_rows = upload_selected_pdf_artifacts_to_s3(
+                    pdf_upload_artifacts, selected_pdf_upload_formats,
+                    PDF_COMPARISON_BUCKET
                 )
+                st.session_state.ingestion_file_upload_results = upload_rows
+                if any(row.get("総合結果") == "成功" for row in upload_rows):
+                    for stale_key in [
+                        "ingestion_file_sync_results", "ingestion_file_synced_config",
+                        "ingestion_file_evaluation"
+                    ]:
+                        st.session_state.pop(stale_key, None)
             except Exception as exc:
                 st.error(f"ファイルS3アップロードエラー: {exc}")
                 st.code(traceback.format_exc())
@@ -3458,7 +3549,7 @@ elif page == "🧪 データ取り込み検証":
         if config_errors:
             for message in config_errors:
                 st.error(message)
-            return
+            return []
         status_box = st.empty()
         live_status = {format_name: "STARTING" for format_name in formats}
 
@@ -3470,11 +3561,47 @@ elif page == "🧪 データ取り込み検証":
         status_box.empty()
         st.session_state[sync_state] = sync_rows
         st.session_state[config_state] = json.loads(json.dumps(subset))
+        return sync_rows
 
-    sync_col1, sync_col2, sync_col3, sync_col4 = st.columns(4)
-    if sync_col1.button("PDF 4KBを同期", key="sync_file_ingestion_kbs"):
-        for stale_key in ["ingestion_file_sync_results", "ingestion_file_synced_config", "ingestion_file_evaluation"]:
-            st.session_state.pop(stale_key, None)
+    configured_pdf_formats = [
+        format_name for format_name in INGESTION_FILE_FORMATS
+        if ingestion_test_config[format_name]["knowledge_base_id"]
+        and ingestion_test_config[format_name]["data_source_id"]
+        and not ingestion_test_config[format_name]["knowledge_base_id"].startswith("KB_ID_")
+        and not ingestion_test_config[format_name]["data_source_id"].startswith("DATA_SOURCE_ID_")
+    ]
+    prior_pdf_upload_rows = st.session_state.get("ingestion_file_upload_results", [])
+    successful_uploaded_formats = [
+        format_name for format_name in configured_pdf_formats
+        if any(row.get("形式") == format_name and row.get("総合結果") == "成功"
+               for row in prior_pdf_upload_rows)
+    ]
+    default_pdf_sync_formats = successful_uploaded_formats or configured_pdf_formats
+    if "ingestion_selected_pdf_sync_formats" in st.session_state:
+        st.session_state.ingestion_selected_pdf_sync_formats = [
+            item for item in st.session_state.ingestion_selected_pdf_sync_formats
+            if item in configured_pdf_formats
+        ]
+    selected_pdf_sync_formats = st.multiselect(
+        "同期するPDF比較方式", options=configured_pdf_formats,
+        default=default_pdf_sync_formats, key="ingestion_selected_pdf_sync_formats"
+    )
+    sync_col1, sync_col2, sync_col3, sync_col4, sync_col5 = st.columns(5)
+    if sync_col1.button("選択したPDF KBを同期", key="sync_selected_file_ingestion_kbs"):
+        if not selected_pdf_sync_formats:
+            st.error("同期するPDF比較方式を1つ以上選択してください。")
+        else:
+            try:
+                sync_rows = run_sync_group(
+                    selected_pdf_sync_formats, "ingestion_file_sync_results",
+                    "ingestion_file_synced_config"
+                )
+                if any(row.get("ステータス") == "COMPLETE" for row in sync_rows):
+                    st.session_state.pop("ingestion_file_evaluation", None)
+            except Exception as exc:
+                st.error(f"ファイルKnowledge Base同期エラー: {exc}")
+                st.code(traceback.format_exc())
+    if sync_col2.button("PDF 4KBを同期", key="sync_file_ingestion_kbs"):
         try:
             configured_formats = []
             for format_name in INGESTION_FILE_FORMATS:
@@ -3488,12 +3615,16 @@ elif page == "🧪 データ取り込み検証":
             if not configured_formats:
                 st.error("同期可能なPDF比較用KB設定がありません。")
             else:
-                run_sync_group(configured_formats, "ingestion_file_sync_results",
-                               "ingestion_file_synced_config")
+                sync_rows = run_sync_group(
+                    configured_formats, "ingestion_file_sync_results",
+                    "ingestion_file_synced_config"
+                )
+                if any(row.get("ステータス") == "COMPLETE" for row in sync_rows):
+                    st.session_state.pop("ingestion_file_evaluation", None)
         except Exception as exc:
             st.error(f"ファイルKnowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
-    if sync_col2.button("Web 2KBを同期", key="sync_web_ingestion_kbs"):
+    if sync_col3.button("Web 2KBを同期", key="sync_web_ingestion_kbs"):
         for stale_key in ["ingestion_web_sync_results", "ingestion_web_synced_config", "ingestion_web_evaluation"]:
             st.session_state.pop(stale_key, None)
         try:
@@ -3502,7 +3633,7 @@ elif page == "🧪 データ取り込み検証":
         except Exception as exc:
             st.error(f"Web Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
-    if sync_col3.button("Excel 3KBを同期", key="sync_excel_ingestion_kbs"):
+    if sync_col4.button("Excel 3KBを同期", key="sync_excel_ingestion_kbs"):
         for stale_key in ["ingestion_excel_sync_results", "ingestion_excel_synced_config", "ingestion_excel_evaluation"]:
             st.session_state.pop(stale_key, None)
         try:
@@ -3511,7 +3642,7 @@ elif page == "🧪 データ取り込み検証":
         except Exception as exc:
             st.error(f"Excel Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
-    if sync_col4.button("Word 3KBを同期", key="sync_word_ingestion_kbs"):
+    if sync_col5.button("Word 3KBを同期", key="sync_word_ingestion_kbs"):
         for key in ["ingestion_word_sync_results", "ingestion_word_synced_config", "ingestion_word_evaluation"]:
             st.session_state.pop(key, None)
         try:
