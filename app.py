@@ -3659,7 +3659,7 @@ elif page == "🧪 データ取り込み検証":
 
         if "回答判定" in question_display.columns:
             st.dataframe(
-                question_display.style.applymap(judgment_color, subset=["回答判定"]),
+                question_display.style.map(judgment_color, subset=["回答判定"]),
                 use_container_width=True
             )
         else:
