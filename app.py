@@ -1086,48 +1086,186 @@ def extract_pdf_full_text(pdf_bytes: bytes) -> tuple[str, str]:
     return full_text, metadata_title or first_text_line[:200]
 
 
-def convert_pdf_text_to_markdown(pdf_text: str, model_id: str) -> str:
-    """Claude Sonnetで全文を分割処理し、記載内容だけを構造化Markdownへ変換する。"""
-    client = create_bedrock_runtime_client()
-    # ページ境界を優先して分割し、巨大PDFでもモデル入力上限を超えにくくする。
-    pages = re.split(r"(?=--- page \d+ ---)", pdf_text)
-    chunks, current = [], ""
-    for page in pages:
-        if current and len(current) + len(page) > 28000:
-            chunks.append(current)
-            current = page
-        else:
-            current += page
-    if current:
-        chunks.append(current)
-
-    markdown_parts = []
-    for index, chunk in enumerate(chunks, start=1):
-        prompt = f"""
-次のPDF抽出テキストを、RAG検索で意味構造が残るMarkdownに変換してください。
-文書タイトル、見出し、小見出し、箇条書き、表、注意事項、条件、対象者、金額、期間、
-必要書類を、原文で判別できる範囲だけ構造化してください。
+TEXT_MARKDOWN_PROMPT = """次のPDF抽出テキストを、RAG検索に適した忠実なMarkdownへ変換してください。
+要約ではなく、対象ページの先頭から末尾まで全情報を処理してください。
 
 厳守事項:
-- 原文にない内容を追加、補完、推測、要約しない
-- 数字、固有名詞、条件を改変しない
-- 読み取れない表を創作しない
-- ページ境界は `<!-- page N -->` として残す
-- Markdown本文のみを返し、コードフェンスや前置きを付けない
-- この入力は全{len(chunks)}分割中の{index}番目です
+- 要約、省略、追加、補完、推測をしない
+- 入力された全情報を保持する
+- 見出し、箇条書き、注記、脚注、URLを保持する
+- 表は可能な限りMarkdown tableとして復元する
+- 表の行見出し、列見出し、数値の対応関係を保持する
+- 金額、日付、割合、固有名詞、条件を変更しない
+- 各ページの先頭に `<!-- page N -->` を正確に1回出力する
+- 対象ページの途中で勝手に終了しない
+- 入力にない内容を補完しない
+- Markdown本文だけを返し、コードフェンス、前置き、説明を付けない
+- 直前バッチ文脈は構造理解のためだけに使い、今回の出力へ重複して再掲しない
+
+対象ページ: {page_start}〜{page_end} / 全{page_count}ページ
+処理バッチ: {batch_index} / {batch_count}
+直前バッチの構造文脈（初回は「なし」）:
+{previous_context}
 
 PDF抽出テキスト:
-{chunk}
+{batch_text}
 """
-        response = client.converse(
-            modelId=model_id,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 8000, "temperature": 0}
-        )
-        part = response["output"]["message"]["content"][0]["text"].strip()
-        part = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", part, flags=re.IGNORECASE)
-        markdown_parts.append(part)
-    return "\n\n".join(markdown_parts).strip()
+
+
+def split_extracted_pdf_text_by_page(pdf_text: str) -> list[dict]:
+    """`--- page N ---`境界を解析し、ページ番号と本文へ分割する。"""
+    pattern = re.compile(r"(?m)^--- page (\d+) ---\s*$")
+    matches = list(pattern.finditer(pdf_text))
+    if not matches:
+        raise ValueError("PDF抽出テキストにページ境界がありません。")
+    pages = []
+    for index, match in enumerate(matches):
+        content_start = match.end()
+        content_end = matches[index + 1].start() if index + 1 < len(matches) else len(pdf_text)
+        pages.append({
+            "page_number": int(match.group(1)),
+            "text": pdf_text[content_start:content_end].strip()
+        })
+    expected = list(range(1, len(pages) + 1))
+    actual = [page["page_number"] for page in pages]
+    if actual != expected:
+        raise ValueError(f"PDF抽出テキストのページ順が不正です: {actual}")
+    return pages
+
+
+def build_text_markdown_batches(pages: list[dict], pages_per_batch: int = 3) -> list[list[dict]]:
+    if pages_per_batch < 1:
+        raise ValueError("pages_per_batchは1以上で指定してください。")
+    return [pages[index:index + pages_per_batch] for index in range(0, len(pages), pages_per_batch)]
+
+
+def validate_markdown_page_coverage(markdown: str, pages: list[dict]) -> None:
+    """対象ページのマーカーが1回ずつ昇順で、本文も欠落していないことを検証する。"""
+    if not markdown.strip():
+        raise ValueError("Markdown出力が空です。")
+    expected = [page["page_number"] for page in pages]
+    markers = [int(value) for value in re.findall(r"<!--\s*page\s+(\d+)\s*-->", markdown)]
+    if markers != expected:
+        raise ValueError(f"ページマーカーが不完全です。expected={expected}, actual={markers}")
+    marker_pattern = re.compile(r"<!--\s*page\s+(\d+)\s*-->")
+    matches = list(marker_pattern.finditer(markdown))
+    for index, (match, page) in enumerate(zip(matches, pages)):
+        section_end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+        section = markdown[match.end():section_end].strip()
+        if page["text"].strip() and not section:
+            raise ValueError(f"page {page['page_number']}のMarkdown本文が空です。")
+
+
+def convert_text_markdown_batch(client, pages: list[dict], model_id: str,
+                                page_count: int, batch_index: int, batch_count: int,
+                                previous_context: str) -> tuple[str, str]:
+    batch_text = "\n\n".join(
+        f"--- page {page['page_number']} ---\n\n{page['text']}" for page in pages
+    )
+    prompt = TEXT_MARKDOWN_PROMPT.format(
+        page_start=pages[0]["page_number"], page_end=pages[-1]["page_number"],
+        page_count=page_count, batch_index=batch_index, batch_count=batch_count,
+        previous_context=previous_context or "なし", batch_text=batch_text
+    )
+    response = client.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 8000, "temperature": 0}
+    )
+    stop_reason = str(response.get("stopReason", ""))
+    if stop_reason != "end_turn":
+        raise ValueError(f"Bedrock応答が正常終了していません: stopReason={stop_reason or 'UNKNOWN'}")
+    markdown = response["output"]["message"]["content"][0]["text"].strip()
+    markdown = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", markdown, flags=re.IGNORECASE)
+    return markdown, stop_reason
+
+
+def convert_pdf_text_to_markdown(pdf_text: str, model_id: str, pages_per_batch: int = 3,
+                                 max_retries: int = 3) -> tuple[str, dict]:
+    """抽出テキストをページバッチ化し、欠落時は自動再分割して完全なMarkdownを返す。"""
+    pages = split_extracted_pdf_text_by_page(pdf_text)
+    initial_batches = build_text_markdown_batches(pages, pages_per_batch)
+    client = create_bedrock_runtime_client()
+    outputs, batch_metrics = [], []
+    retry_count = 0
+    attempt_number = 0
+    total_started = time.perf_counter()
+
+    def process_batch(batch_pages: list[dict], initial_batch_index: int,
+                      previous_context: str, retry_depth: int = 0) -> list[str]:
+        nonlocal retry_count, attempt_number
+        attempt_number += 1
+        started = time.perf_counter()
+        stop_reason, error = "", ""
+        try:
+            markdown, stop_reason = convert_text_markdown_batch(
+                client, batch_pages, model_id, len(pages), initial_batch_index,
+                len(initial_batches), previous_context
+            )
+            validate_markdown_page_coverage(markdown, batch_pages)
+            batch_metrics.append({
+                "batch": attempt_number, "page_start": batch_pages[0]["page_number"],
+                "page_end": batch_pages[-1]["page_number"],
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                "stop_reason": stop_reason, "retry_count": retry_depth,
+                "result": "成功", "error": ""
+            })
+            return [markdown]
+        except Exception as exc:
+            error = str(exc)
+            if not stop_reason:
+                stop_match = re.search(r"stopReason=([^\s]+)", error)
+                stop_reason = stop_match.group(1) if stop_match else "API_ERROR"
+            batch_metrics.append({
+                "batch": attempt_number, "page_start": batch_pages[0]["page_number"],
+                "page_end": batch_pages[-1]["page_number"],
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                "stop_reason": stop_reason, "retry_count": retry_depth,
+                "result": "失敗", "error": error
+            })
+            if retry_depth >= max_retries:
+                raise ValueError(
+                    f"page {batch_pages[0]['page_number']}〜{batch_pages[-1]['page_number']}の変換に失敗: {error}"
+                ) from exc
+            retry_count += 1
+            if len(batch_pages) > 1:
+                split_at = (len(batch_pages) + 1) // 2
+                left_pages, right_pages = batch_pages[:split_at], batch_pages[split_at:]
+                left_outputs = process_batch(
+                    left_pages, initial_batch_index, previous_context, retry_depth + 1
+                )
+                right_context = left_outputs[-1][-1500:] if left_outputs else previous_context
+                right_outputs = process_batch(
+                    right_pages, initial_batch_index, right_context, retry_depth + 1
+                )
+                return left_outputs + right_outputs
+            return process_batch(
+                batch_pages, initial_batch_index, previous_context, retry_depth + 1
+            )
+
+    def build_metrics(page_markers_complete: bool) -> dict:
+        return {
+            "page_count": len(pages), "pages_per_batch": pages_per_batch,
+            "batch_count": sum(metric["result"] == "成功" for metric in batch_metrics),
+            "batch_metrics": batch_metrics, "retry_count": retry_count,
+            "stop_reason": batch_metrics[-1]["stop_reason"] if batch_metrics else "",
+            "page_markers_complete": page_markers_complete,
+            "total_elapsed_ms": round((time.perf_counter() - total_started) * 1000, 1)
+        }
+
+    try:
+        for batch_index, batch_pages in enumerate(initial_batches, start=1):
+            previous_context = outputs[-1][-1500:] if outputs else "なし"
+            outputs.extend(process_batch(batch_pages, batch_index, previous_context))
+        markdown = "\n\n".join(outputs).strip()
+        validate_markdown_page_coverage(markdown, pages)
+        metrics = build_metrics(True)
+        metrics["stop_reason"] = "end_turn"
+        return markdown, metrics
+    except Exception as exc:
+        wrapped = ValueError(str(exc))
+        wrapped.metrics = build_metrics(False)
+        raise wrapped from exc
 
 
 VISION_MARKDOWN_PROMPT = """このPDFページを、人間がページを見たときの視覚構造に基づいて、
@@ -2643,7 +2781,7 @@ elif page == "🧪 データ取り込み検証":
                                 pass
 
                         selected_formats, markdown_ms, vision_markdown_ms = [], 0.0, 0.0
-                        vision_metrics = {}
+                        markdown_metrics, vision_metrics = {}, {}
                         if include_pdf:
                             selected_formats.append(("FILE_PDF", "pdf", "source.pdf", pdf_bytes, None, 0.0))
                         if include_txt:
@@ -2654,11 +2792,14 @@ elif page == "🧪 データ取り込み検証":
                             else:
                                 markdown_started = time.perf_counter()
                                 try:
-                                    markdown_text = convert_pdf_text_to_markdown(pdf_text, markdown_model_id)
+                                    markdown_text, markdown_metrics = convert_pdf_text_to_markdown(
+                                        pdf_text, markdown_model_id
+                                    )
                                     markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
                                     selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", markdown_text, None, extraction_ms + markdown_ms))
                                 except Exception as exc:
                                     markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
+                                    markdown_metrics = getattr(exc, "metrics", {})
                                     selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", "", str(exc), extraction_ms + markdown_ms))
                         if include_vision_markdown:
                             vision_started = time.perf_counter()
@@ -2691,6 +2832,13 @@ elif page == "🧪 データ取り込み検証":
                                     "変換時間(ms)": conversion_ms,
                                     "結果": "失敗", "エラー内容": error
                                 })
+                                if config_name == "FILE_MARKDOWN" and markdown_metrics:
+                                    previews.append({
+                                        "datasource_id": datasource_id, "source": original_name,
+                                        "format": config_name, "count": 0, "metadata": {}, "text": "",
+                                        "result": "失敗", "markdown_metrics": markdown_metrics,
+                                        "vision_metrics": {}
+                                    })
                                 continue
                             metadata = build_ingestion_metadata(
                                 "pdf", format_name, ingestion_ui_metadata, pdf_source_url,
@@ -2728,6 +2876,8 @@ elif page == "🧪 データ取り込み検証":
                                         content[:20000] if config_name == "FILE_VISION_MARKDOWN"
                                         else content[:5000]
                                     ) if isinstance(content, str) else "",
+                                    "result": "失敗",
+                                    "markdown_metrics": markdown_metrics if config_name == "FILE_MARKDOWN" else {},
                                     "vision_metrics": vision_metrics if config_name == "FILE_VISION_MARKDOWN" else {}
                                 })
                                 continue
@@ -2748,6 +2898,8 @@ elif page == "🧪 データ取り込み検証":
                                     content[:20000] if config_name == "FILE_VISION_MARKDOWN"
                                     else content[:5000]
                                 ) if isinstance(content, str) else "",
+                                "result": "成功",
+                                "markdown_metrics": markdown_metrics if config_name == "FILE_MARKDOWN" else {},
                                 "vision_metrics": vision_metrics if config_name == "FILE_VISION_MARKDOWN" else {}
                             })
                             successful_formats[config_name] = content
@@ -2774,8 +2926,19 @@ elif page == "🧪 データ取り込み検証":
             st.dataframe(pd.DataFrame(pdf_output["results"]), use_container_width=True)
             st.dataframe(build_conversion_summary(pdf_output["results"]), use_container_width=True)
             for preview in pdf_output["previews"]:
-                with st.expander(f"✅ {preview['datasource_id']} / {preview['source']} / {preview['format']} / {preview['count']}文字"):
-                    st.json(preview["metadata"])
+                preview_icon = "✅" if preview.get("result", "成功") == "成功" else "❌"
+                with st.expander(f"{preview_icon} {preview['datasource_id']} / {preview['source']} / {preview['format']} / {preview['count']}文字"):
+                    if preview["metadata"]:
+                        st.json(preview["metadata"])
+                    if preview.get("markdown_metrics"):
+                        st.json({
+                            key: value for key, value in preview["markdown_metrics"].items()
+                            if key != "batch_metrics"
+                        })
+                        st.dataframe(
+                            pd.DataFrame(preview["markdown_metrics"].get("batch_metrics", [])),
+                            use_container_width=True
+                        )
                     if preview.get("vision_metrics"):
                         st.json({
                             key: value for key, value in preview["vision_metrics"].items()
