@@ -353,9 +353,10 @@ def _setting(section: str, key: str, default: str = "") -> str:
         return default
 
 
-def validate_ingestion_test_config(bucket: str, config: dict) -> list[str]:
+def validate_ingestion_test_config(bucket: str, config: dict,
+                                   require_bucket: bool = True) -> list[str]:
     errors = []
-    if not bucket.strip():
+    if require_bucket and not bucket.strip():
         errors.append("S3バケット名が未設定です。")
     kb_ids = []
     for format_name, values in config.items():
@@ -637,6 +638,66 @@ def run_ingestion_sync(config: dict, timeout_seconds: int, status_callback=None)
             "ステータス": "TIMEOUT", "失敗理由": f"{timeout_seconds}秒でタイムアウトしました。"
         })
     return results
+
+
+def get_latest_ingestion_job_statuses(config: dict, client=None) -> list[dict]:
+    """各Data Sourceの最新Ingestion JobをAWSから取得し、方式ごとに結果を返す。"""
+    client = client or create_aws_client("bedrock-agent")
+    rows = []
+    for format_name, values in config.items():
+        knowledge_base_id = str(values.get("knowledge_base_id", "")).strip()
+        data_source_id = str(values.get("data_source_id", "")).strip()
+        row = {
+            "形式": format_name,
+            "Knowledge Base ID": knowledge_base_id,
+            "Data Source ID": data_source_id,
+            "Ingestion Job ID": "",
+            "ステータス": "NOT_CONFIGURED",
+            "開始時刻": None,
+            "更新時刻": None,
+            "エラー内容": ""
+        }
+        if (not knowledge_base_id or not data_source_id
+                or knowledge_base_id.startswith("KB_ID_")
+                or data_source_id.startswith("DATA_SOURCE_ID_")):
+            row["エラー内容"] = "Knowledge Base ID / Data Source ID未設定"
+            rows.append(row)
+            continue
+        try:
+            response = client.list_ingestion_jobs(
+                knowledgeBaseId=knowledge_base_id,
+                dataSourceId=data_source_id,
+                sortBy={"attribute": "STARTED_AT", "order": "DESCENDING"},
+                maxResults=1
+            )
+            summaries = response.get("ingestionJobSummaries", [])
+            if not summaries:
+                row["ステータス"] = "NO_HISTORY"
+                row["エラー内容"] = "同期履歴なし"
+            else:
+                latest = summaries[0]
+                row.update({
+                    "Ingestion Job ID": latest.get("ingestionJobId", ""),
+                    "ステータス": latest.get("status", "UNKNOWN"),
+                    "開始時刻": latest.get("startedAt"),
+                    "更新時刻": latest.get("updatedAt")
+                })
+        except Exception as exc:
+            row["ステータス"] = "API_ERROR"
+            row["エラー内容"] = str(exc)
+        rows.append(row)
+    return rows
+
+
+def ingestion_status_errors(status_rows: list[dict]) -> list[str]:
+    """COMPLETE以外の方式を、画面表示可能な具体的メッセージへ変換する。"""
+    errors = []
+    for row in status_rows:
+        if row.get("ステータス") == "COMPLETE":
+            continue
+        detail = row.get("エラー内容") or "最新Ingestion JobがCOMPLETEではありません"
+        errors.append(f"{row.get('形式')}: {row.get('ステータス')} - {detail}")
+    return errors
 
 
 INGESTION_ANSWER_PROMPT = """あなたは大学の奨学金業務のベテラン職員です。
@@ -3211,27 +3272,29 @@ elif page == "🧪 データ取り込み検証":
             st.dataframe(pd.DataFrame(st.session_state[state_key]), use_container_width=True)
 
     st.subheader("2. Knowledge Base同期")
+    if st.button("AWS同期状態を再確認", key="refresh_ingestion_aws_sync_status"):
+        with st.spinner("AWS上の最新Ingestion Jobを確認しています..."):
+            st.session_state.ingestion_aws_sync_status = get_latest_ingestion_job_statuses(
+                {key: ingestion_test_config[key] for key in INGESTION_ALL_FORMATS}
+            )
+    if st.session_state.get("ingestion_aws_sync_status"):
+        st.markdown("**AWS最新同期状態**")
+        st.dataframe(
+            pd.DataFrame(st.session_state.ingestion_aws_sync_status),
+            use_container_width=True
+        )
     sync_timeout = st.number_input(
         "同期タイムアウト（秒）", min_value=60, max_value=7200, value=1800, step=60,
         key="ingestion_sync_timeout"
     )
-    def run_sync_group(formats, upload_state, sync_state, config_state, conversion_output_state=""):
+    def run_sync_group(formats, sync_state, config_state):
         subset = {key: ingestion_test_config[key] for key in formats}
-        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
-        upload_results = st.session_state.get(upload_state, [])
+        config_errors = validate_ingestion_test_config(
+            ingestion_bucket, subset, require_bucket=False
+        )
         if config_errors:
             for message in config_errors:
                 st.error(message)
-            return
-        if conversion_output_state:
-            conversion_rows = st.session_state.get(conversion_output_state, {}).get("results", [])
-            for format_name in formats:
-                format_rows = [row for row in conversion_rows if row.get("生成形式") == format_name]
-                if not format_rows or any(row.get("結果") != "成功" for row in format_rows):
-                    st.error(f"{format_name}のS3保存が成功してから同期してください。")
-                    return
-        elif not upload_results or any(row["アップロード結果"] != "成功" for row in upload_results):
-            st.error("対象成果物のS3アップロードがすべて成功してから同期してください。")
             return
         status_box = st.empty()
         live_status = {format_name: "STARTING" for format_name in formats}
@@ -3262,9 +3325,8 @@ elif page == "🧪 データ取り込み検証":
             if not configured_formats:
                 st.error("同期可能なPDF比較用KB設定がありません。")
             else:
-                run_sync_group(configured_formats, "ingestion_file_upload_results",
-                               "ingestion_file_sync_results", "ingestion_file_synced_config",
-                               conversion_output_state="ingestion_pdf_output")
+                run_sync_group(configured_formats, "ingestion_file_sync_results",
+                               "ingestion_file_synced_config")
         except Exception as exc:
             st.error(f"ファイルKnowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
@@ -3272,8 +3334,8 @@ elif page == "🧪 データ取り込み検証":
         for stale_key in ["ingestion_web_sync_results", "ingestion_web_synced_config", "ingestion_web_evaluation"]:
             st.session_state.pop(stale_key, None)
         try:
-            run_sync_group(INGESTION_WEB_FORMATS, "ingestion_web_upload_results",
-                           "ingestion_web_sync_results", "ingestion_web_synced_config")
+            run_sync_group(INGESTION_WEB_FORMATS, "ingestion_web_sync_results",
+                           "ingestion_web_synced_config")
         except Exception as exc:
             st.error(f"Web Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
@@ -3281,8 +3343,8 @@ elif page == "🧪 データ取り込み検証":
         for stale_key in ["ingestion_excel_sync_results", "ingestion_excel_synced_config", "ingestion_excel_evaluation"]:
             st.session_state.pop(stale_key, None)
         try:
-            run_sync_group(INGESTION_EXCEL_FORMATS, "ingestion_excel_upload_results",
-                           "ingestion_excel_sync_results", "ingestion_excel_synced_config")
+            run_sync_group(INGESTION_EXCEL_FORMATS, "ingestion_excel_sync_results",
+                           "ingestion_excel_synced_config")
         except Exception as exc:
             st.error(f"Excel Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
@@ -3290,8 +3352,8 @@ elif page == "🧪 データ取り込み検証":
         for key in ["ingestion_word_sync_results", "ingestion_word_synced_config", "ingestion_word_evaluation"]:
             st.session_state.pop(key, None)
         try:
-            run_sync_group(INGESTION_WORD_FORMATS, "ingestion_word_upload_results",
-                           "ingestion_word_sync_results", "ingestion_word_synced_config")
+            run_sync_group(INGESTION_WORD_FORMATS, "ingestion_word_sync_results",
+                           "ingestion_word_synced_config")
         except Exception as exc:
             st.error(f"Word Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
@@ -3464,19 +3526,31 @@ elif page == "🧪 データ取り込み検証":
         key="ingestion_word_chunking_confirmed"
     )
 
-    def run_evaluation_group(formats, sync_state, config_state, output_state, chunking_ok):
+    def run_evaluation_group(formats, output_state, chunking_ok):
         subset = {key: ingestion_test_config[key] for key in formats}
-        sync_results = st.session_state.get(sync_state, [])
-        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        config_errors = validate_ingestion_test_config(
+            ingestion_bucket, subset, require_bucket=False
+        )
         if config_errors:
             for message in config_errors:
                 st.error(message)
+            return
+        aws_status_rows = get_latest_ingestion_job_statuses(subset)
+        cached_rows = {
+            row["形式"]: row for row in st.session_state.get("ingestion_aws_sync_status", [])
+        }
+        cached_rows.update({row["形式"]: row for row in aws_status_rows})
+        st.session_state.ingestion_aws_sync_status = [
+            cached_rows[format_name]
+            for format_name in INGESTION_ALL_FORMATS
+            if format_name in cached_rows
+        ]
+        aws_errors = ingestion_status_errors(aws_status_rows)
+        if aws_errors:
+            for message in aws_errors:
+                st.error(message)
         elif not chunking_ok:
             st.error("対象KBのChunking条件を確認してください。")
-        elif len(sync_results) != len(formats) or any(row["ステータス"] != "COMPLETE" for row in sync_results):
-            st.error("対象Knowledge Baseの同期がすべてCOMPLETEではありません。")
-        elif st.session_state.get(config_state) != subset:
-            st.error("KB/Data Source IDが同期完了時から変更されています。再同期してください。")
         elif evaluation_questions is None or evaluation_questions.empty:
             st.error("questionを含む評価質問CSVをアップロードしてください。")
         else:
@@ -3507,32 +3581,28 @@ elif page == "🧪 データ取り込み検証":
     eval_col1, eval_col2, eval_col3, eval_col4 = st.columns(4)
     if eval_col1.button("ファイルRetrieve比較を実行", type="primary", key="run_file_ingestion_evaluation"):
         try:
-            run_evaluation_group(INGESTION_FILE_FORMATS, "ingestion_file_sync_results",
-                                 "ingestion_file_synced_config", "ingestion_file_evaluation",
+            run_evaluation_group(INGESTION_FILE_FORMATS, "ingestion_file_evaluation",
                                  chunking_confirmed)
         except Exception as exc:
             st.error(f"ファイルRetrieve / 回答生成エラー: {exc}")
             st.code(traceback.format_exc())
     if eval_col2.button("Web Retrieve比較を実行", type="primary", key="run_web_ingestion_evaluation"):
         try:
-            run_evaluation_group(INGESTION_WEB_FORMATS, "ingestion_web_sync_results",
-                                 "ingestion_web_synced_config", "ingestion_web_evaluation",
+            run_evaluation_group(INGESTION_WEB_FORMATS, "ingestion_web_evaluation",
                                  chunking_confirmed)
         except Exception as exc:
             st.error(f"Web Retrieve / 回答生成エラー: {exc}")
             st.code(traceback.format_exc())
     if eval_col3.button("Excel Retrieve比較を実行", type="primary", key="run_excel_ingestion_evaluation"):
         try:
-            run_evaluation_group(INGESTION_EXCEL_FORMATS, "ingestion_excel_sync_results",
-                                 "ingestion_excel_synced_config", "ingestion_excel_evaluation",
+            run_evaluation_group(INGESTION_EXCEL_FORMATS, "ingestion_excel_evaluation",
                                  excel_chunking_confirmed)
         except Exception as exc:
             st.error(f"Excel Retrieve / 回答生成エラー: {exc}")
             st.code(traceback.format_exc())
     if eval_col4.button("Word Retrieve比較を実行", type="primary", key="run_word_ingestion_evaluation"):
         try:
-            run_evaluation_group(INGESTION_WORD_FORMATS, "ingestion_word_sync_results",
-                                 "ingestion_word_synced_config", "ingestion_word_evaluation",
+            run_evaluation_group(INGESTION_WORD_FORMATS, "ingestion_word_evaluation",
                                  word_chunking_confirmed)
         except Exception as exc:
             st.error(f"Word Retrieve / 回答生成エラー: {exc}")

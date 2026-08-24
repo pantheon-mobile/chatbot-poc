@@ -142,6 +142,7 @@ Overlap 60 tokensに手動設定してください。画面上の確認チェッ
 | `boto3.client("s3")` | `put_object` | `s3:PutObject` | `arn:aws:s3:::<BUCKET>/documents/ingestion-test/*` | 成果物配置 |
 | `boto3.client("bedrock-agent")` | `start_ingestion_job` | `bedrock:StartIngestionJob` | 検証用Knowledge Base ARN | 同期開始 |
 | `boto3.client("bedrock-agent")` | `get_ingestion_job` | `bedrock:GetIngestionJob` | 検証用Knowledge Base ARN | 同期状態取得 |
+| `boto3.client("bedrock-agent")` | `list_ingestion_jobs` | `bedrock:ListIngestionJobs` | 検証用Knowledge Base ARN | AWS上の最新同期状態取得 |
 | `boto3.client("bedrock-agent-runtime")` | `retrieve` | `bedrock:Retrieve` | 検証用Knowledge Base ARN | Retrieve評価 |
 | `boto3.client("bedrock-runtime")` | `converse` | `bedrock:InvokeModel` | Inference Profile ARNと配下Foundation Model ARN | 変換・回答生成 |
 | `boto3.client("bedrock-agent-runtime")` | `retrieve_and_generate` | `bedrock:RetrieveAndGenerate` | `*` | 既存チャット回答 |
@@ -163,7 +164,7 @@ PoC実行ロールの最小ポリシー例です。`<...>`は実リソースへ�
     {
       "Sid": "TestKnowledgeBases",
       "Effect": "Allow",
-      "Action": ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob", "bedrock:Retrieve"],
+      "Action": ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob", "bedrock:ListIngestionJobs", "bedrock:Retrieve"],
       "Resource": ["arn:aws:bedrock:ap-northeast-1:<ACCOUNT_ID>:knowledge-base/<TEST_KB_ID>"]
     },
     {
