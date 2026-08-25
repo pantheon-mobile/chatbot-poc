@@ -300,10 +300,12 @@ def dataframe_csv_bom(frame: pd.DataFrame) -> bytes:
 def apply_effective_manual_review(frame: pd.DataFrame) -> pd.DataFrame:
     """自動判定を保持したまま、入力済み手動判定をeffective列へ反映する。"""
     result = frame.copy()
+
     if "auto_answer_judgment" not in result:
         result["auto_answer_judgment"] = result.get("answer_judgment", "")
     if "auto_answer_score" not in result:
         result["auto_answer_score"] = result.get("answer_score", None)
+
     defaults = {
         "manual_answer_judgment": "未確認", "manual_answer_score": None,
         "manual_review_comment": "", "manual_reviewer": "", "manual_reviewed_at": ""
@@ -311,18 +313,27 @@ def apply_effective_manual_review(frame: pd.DataFrame) -> pd.DataFrame:
     for column, default in defaults.items():
         if column not in result:
             result[column] = default
+
     manual = result["manual_answer_judgment"].fillna("").astype(str).str.upper()
     has_manual = manual.isin(MANUAL_JUDGMENT_SCORES)
-    result["manual_answer_score"] = [
-        MANUAL_JUDGMENT_SCORES.get(value) if enabled else None
-        for value, enabled in zip(manual, has_manual)
-    ]
-    result["effective_answer_judgment"] = result["auto_answer_judgment"]
-    result.loc[has_manual, "effective_answer_judgment"] = manual[has_manual]
+    result["manual_answer_score"] = pd.to_numeric(
+        manual.map(MANUAL_JUDGMENT_SCORES), errors="coerce"
+    )
+    result["effective_answer_judgment"] = (
+        result["auto_answer_judgment"].fillna("").astype(str)
+    )
     result["effective_answer_score"] = pd.to_numeric(
         result["auto_answer_score"], errors="coerce"
     ).astype(float)
-    result.loc[has_manual, "effective_answer_score"] = result.loc[has_manual, "manual_answer_score"]
+
+    if has_manual.any():
+        result.loc[has_manual, "effective_answer_judgment"] = (
+            manual.loc[has_manual].to_numpy()
+        )
+        result.loc[has_manual, "effective_answer_score"] = (
+            result.loc[has_manual, "manual_answer_score"].astype(float).to_numpy()
+        )
+
     return result
 
 

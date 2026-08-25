@@ -2,6 +2,7 @@ import ast
 import io
 import json
 import uuid
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -182,3 +183,78 @@ def test_question_text_fallback_partial_weight_and_manual_effective_priority():
          "weighted_accuracy": 1.0, "accuracy": 1.0, "average_total_ms": 20},
     ]))
     assert recommendation["formats"] == ["B"]
+
+
+def test_effective_manual_review_with_all_rows_unreviewed():
+    apply_review = _load("apply_effective_manual_review")["apply_effective_manual_review"]
+    frame = pd.DataFrame([
+        {"auto_answer_judgment": "CORRECT", "auto_answer_score": 1.0,
+         "manual_answer_judgment": "未確認"},
+        {"auto_answer_judgment": "INCORRECT", "auto_answer_score": 0.0,
+         "manual_answer_judgment": "未確認"},
+    ])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = apply_review(frame)
+
+    assert result["effective_answer_judgment"].tolist() == ["CORRECT", "INCORRECT"]
+    assert result["effective_answer_score"].tolist() == [1.0, 0.0]
+    assert result["effective_answer_score"].dtype == float
+
+
+def test_effective_manual_review_without_manual_judgment_column():
+    apply_review = _load("apply_effective_manual_review")["apply_effective_manual_review"]
+    frame = pd.DataFrame([
+        {"auto_answer_judgment": "CORRECT", "auto_answer_score": 1},
+        {"auto_answer_judgment": "PARTIAL", "auto_answer_score": 0.5},
+    ])
+
+    result = apply_review(frame)
+
+    assert result["manual_answer_judgment"].tolist() == ["未確認", "未確認"]
+    assert result["effective_answer_judgment"].tolist() == ["CORRECT", "PARTIAL"]
+    assert result["effective_answer_score"].tolist() == [1.0, 0.5]
+
+
+def test_effective_manual_review_overrides_only_reviewed_row():
+    apply_review = _load("apply_effective_manual_review")["apply_effective_manual_review"]
+    frame = pd.DataFrame([
+        {"auto_answer_judgment": "INCORRECT", "auto_answer_score": 0,
+         "manual_answer_judgment": "PARTIAL"},
+        {"auto_answer_judgment": "CORRECT", "auto_answer_score": 1,
+         "manual_answer_judgment": "未確認"},
+    ])
+
+    result = apply_review(frame)
+
+    assert result["effective_answer_judgment"].tolist() == ["PARTIAL", "CORRECT"]
+    assert result["effective_answer_score"].tolist() == [0.5, 1.0]
+    assert result["manual_answer_score"].iloc[0] == 0.5
+    assert pd.isna(result["manual_answer_score"].iloc[1])
+
+
+def test_effective_manual_review_accepts_empty_dataframe():
+    apply_review = _load("apply_effective_manual_review")["apply_effective_manual_review"]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = apply_review(pd.DataFrame())
+
+    assert result.empty
+    assert result["effective_answer_score"].dtype == float
+
+
+def test_effective_manual_review_normalizes_mixed_auto_scores():
+    apply_review = _load("apply_effective_manual_review")["apply_effective_manual_review"]
+    frame = pd.DataFrame([
+        {"auto_answer_judgment": "CORRECT", "auto_answer_score": "1"},
+        {"auto_answer_judgment": "INCORRECT", "auto_answer_score": ""},
+        {"auto_answer_judgment": "INCORRECT", "auto_answer_score": None},
+    ])
+
+    result = apply_review(frame)
+
+    assert result["effective_answer_score"].iloc[0] == 1.0
+    assert result["effective_answer_score"].iloc[1:].isna().all()
+    assert result["effective_answer_score"].dtype == float
