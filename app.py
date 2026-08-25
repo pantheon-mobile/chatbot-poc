@@ -10,6 +10,7 @@ import re
 import os
 import time
 import uuid
+from collections import Counter
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -1203,26 +1204,144 @@ def build_text_markdown_batches(pages: list[dict], pages_per_batch: int = 3) -> 
     return [pages[index:index + pages_per_batch] for index in range(0, len(pages), pages_per_batch)]
 
 
-def validate_markdown_page_coverage(markdown: str, pages: list[dict]) -> None:
-    """対象ページのマーカーが1回ずつ昇順で、本文も欠落していないことを検証する。"""
-    if not markdown.strip():
-        raise ValueError("Markdown出力が空です。")
+STRICT_PAGE_MARKER = re.compile(r"^<!-- page ([1-9][0-9]*) -->[ \t]*$")
+ESCAPED_PAGE_MARKER = re.compile(r"^[ \t]*\\+(?=<!-- page [1-9][0-9]* -->[ \t]*$)")
+CODE_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+
+
+def normalize_markdown_page_markers(markdown: str) -> tuple[str, int]:
+    """コードフェンス外の、単独行になったページマーカー先頭だけを正規化する。"""
+    output, normalization_count = [], 0
+    fence_character, fence_length = "", 0
+    for line in markdown.splitlines(keepends=True):
+        line_body = line.rstrip("\r\n")
+        newline = line[len(line_body):]
+        fence_match = CODE_FENCE.match(line_body)
+        if fence_match:
+            token = fence_match.group(1)
+            if not fence_character:
+                fence_character, fence_length = token[0], len(token)
+            elif token[0] == fence_character and len(token) >= fence_length:
+                fence_character, fence_length = "", 0
+            output.append(line)
+            continue
+        if not fence_character and ESCAPED_PAGE_MARKER.match(line_body):
+            normalized = ESCAPED_PAGE_MARKER.sub("", line_body)
+            output.append(normalized + newline)
+            normalization_count += 1
+        else:
+            output.append(line)
+    return "".join(output), normalization_count
+
+
+def _strict_page_marker_matches(markdown: str) -> list[dict]:
+    """コードフェンス外で行全体が厳密なページマーカーである行を返す。"""
+    matches, offset = [], 0
+    fence_character, fence_length = "", 0
+    for line in markdown.splitlines(keepends=True):
+        line_body = line.rstrip("\r\n")
+        fence_match = CODE_FENCE.match(line_body)
+        if fence_match:
+            token = fence_match.group(1)
+            if not fence_character:
+                fence_character, fence_length = token[0], len(token)
+            elif token[0] == fence_character and len(token) >= fence_length:
+                fence_character, fence_length = "", 0
+        elif not fence_character:
+            marker_match = STRICT_PAGE_MARKER.fullmatch(line_body)
+            if marker_match:
+                matches.append({
+                    "page_number": int(marker_match.group(1)),
+                    "start": offset, "end": offset + len(line_body)
+                })
+        offset += len(line)
+    return matches
+
+
+def analyze_markdown_page_coverage(markdown: str, pages: list[dict]) -> dict:
+    """厳密なページマーカーの網羅性、順序、重複、ページ本文を解析する。"""
     expected = [page["page_number"] for page in pages]
-    markers = [int(value) for value in re.findall(r"<!--\s*page\s+(\d+)\s*-->", markdown)]
-    if markers != expected:
-        raise ValueError(f"ページマーカーが不完全です。expected={expected}, actual={markers}")
-    marker_pattern = re.compile(r"<!--\s*page\s+(\d+)\s*-->")
-    matches = list(marker_pattern.finditer(markdown))
-    for index, (match, page) in enumerate(zip(matches, pages)):
-        section_end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
-        section = markdown[match.end():section_end].strip()
-        if page["text"].strip() and not section:
-            raise ValueError(f"page {page['page_number']}のMarkdown本文が空です。")
+    marker_matches = _strict_page_marker_matches(markdown)
+    actual = [item["page_number"] for item in marker_matches]
+    counts = Counter(actual)
+    missing = [number for number in expected if counts[number] == 0]
+    duplicates = [number for number in expected if counts[number] > 1]
+    unexpected = sorted(number for number in counts if number not in expected)
+    sections, empty_pages = {}, []
+    for index, marker in enumerate(marker_matches):
+        section_end = marker_matches[index + 1]["start"] if index + 1 < len(marker_matches) else len(markdown)
+        section = markdown[marker["end"]:section_end].strip()
+        sections.setdefault(marker["page_number"], section)
+    for page in pages:
+        if page["text"].strip() and not sections.get(page["page_number"], "").strip():
+            empty_pages.append(page["page_number"])
+    last_expected = expected[-1] if expected else None
+    last_page_has_content = bool(last_expected and sections.get(last_expected, "").strip())
+    complete = bool(markdown.strip()) and all([
+        not missing, not duplicates, not unexpected, actual == expected,
+        not empty_pages, last_page_has_content
+    ])
+    return {
+        "page_markers_complete": complete,
+        "page_marker_count": len(actual), "expected_page_count": len(expected),
+        "missing_page_numbers": missing, "duplicate_page_numbers": duplicates,
+        "unexpected_page_numbers": unexpected, "page_marker_order_valid": actual == expected,
+        "empty_page_numbers": empty_pages,
+        "last_page_number": actual[-1] if actual else None,
+        "last_page_has_content": last_page_has_content,
+        "page_sections": sections
+    }
+
+
+def validate_markdown_page_coverage(markdown: str, pages: list[dict]) -> dict:
+    """厳密なページ網羅性を検証し、成功時は詳細メトリクスを返す。"""
+    metrics = analyze_markdown_page_coverage(markdown, pages)
+    if not metrics["page_markers_complete"]:
+        error = ValueError(
+            "ページマーカーまたは本文が不完全です: "
+            f"missing={metrics['missing_page_numbers']}, "
+            f"duplicate={metrics['duplicate_page_numbers']}, "
+            f"unexpected={metrics['unexpected_page_numbers']}, "
+            f"order_valid={metrics['page_marker_order_valid']}, "
+            f"empty_pages={metrics['empty_page_numbers']}"
+        )
+        error.coverage_metrics = metrics
+        raise error
+    return metrics
+
+
+def split_markdown_by_page(markdown: str) -> dict[int, str]:
+    """厳密なページマーカーを使い、ページ別プレビュー用本文を返す。"""
+    matches = _strict_page_marker_matches(markdown)
+    return {
+        marker["page_number"]: markdown[
+            marker["start"]:(matches[index + 1]["start"] if index + 1 < len(matches) else len(markdown))
+        ].strip()
+        for index, marker in enumerate(matches)
+    }
+
+
+def markdown_s3_upload_allowed(metrics: dict) -> tuple[bool, list[str]]:
+    """通常MarkdownをS3へ送れる必須完全性条件か判定する。"""
+    reasons = []
+    if not metrics.get("page_markers_complete"):
+        reasons.append("全ページマーカーが完全ではありません。")
+    if metrics.get("missing_page_numbers"):
+        reasons.append("欠落ページがあります。")
+    if metrics.get("duplicate_page_numbers"):
+        reasons.append("重複ページがあります。")
+    if not metrics.get("last_page_has_content"):
+        reasons.append("最終ページ本文が空です。")
+    if metrics.get("unresolved_max_tokens"):
+        reasons.append("未解決のmax_tokensがあります。")
+    if metrics.get("empty_page_numbers"):
+        reasons.append("本文が空のページがあります。")
+    return not reasons, reasons
 
 
 def convert_text_markdown_batch(client, pages: list[dict], model_id: str,
                                 page_count: int, batch_index: int, batch_count: int,
-                                previous_context: str) -> tuple[str, str]:
+                                previous_context: str) -> tuple[str, str, int]:
     batch_text = "\n\n".join(
         f"--- page {page['page_number']} ---\n\n{page['text']}" for page in pages
     )
@@ -1241,7 +1360,8 @@ def convert_text_markdown_batch(client, pages: list[dict], model_id: str,
         raise ValueError(f"Bedrock応答が正常終了していません: stopReason={stop_reason or 'UNKNOWN'}")
     markdown = response["output"]["message"]["content"][0]["text"].strip()
     markdown = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", markdown, flags=re.IGNORECASE)
-    return markdown, stop_reason
+    markdown, normalization_count = normalize_markdown_page_markers(markdown)
+    return markdown, stop_reason, normalization_count
 
 
 def convert_pdf_text_to_markdown(pdf_text: str, model_id: str, pages_per_batch: int = 3,
@@ -1253,26 +1373,28 @@ def convert_pdf_text_to_markdown(pdf_text: str, model_id: str, pages_per_batch: 
     outputs, batch_metrics = [], []
     retry_count = 0
     attempt_number = 0
+    page_marker_normalization_count = 0
     total_started = time.perf_counter()
 
     def process_batch(batch_pages: list[dict], initial_batch_index: int,
                       previous_context: str, retry_depth: int = 0) -> list[str]:
-        nonlocal retry_count, attempt_number
+        nonlocal retry_count, attempt_number, page_marker_normalization_count
         attempt_number += 1
         started = time.perf_counter()
-        stop_reason, error = "", ""
+        stop_reason, error, markdown = "", "", ""
         try:
-            markdown, stop_reason = convert_text_markdown_batch(
+            markdown, stop_reason, normalization_count = convert_text_markdown_batch(
                 client, batch_pages, model_id, len(pages), initial_batch_index,
                 len(initial_batches), previous_context
             )
             validate_markdown_page_coverage(markdown, batch_pages)
+            page_marker_normalization_count += normalization_count
             batch_metrics.append({
                 "batch": attempt_number, "page_start": batch_pages[0]["page_number"],
                 "page_end": batch_pages[-1]["page_number"],
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
                 "stop_reason": stop_reason, "retry_count": retry_depth,
-                "result": "成功", "error": ""
+                "result": "成功", "error": "", "output_characters": len(markdown)
             })
             return [markdown]
         except Exception as exc:
@@ -1285,7 +1407,7 @@ def convert_pdf_text_to_markdown(pdf_text: str, model_id: str, pages_per_batch: 
                 "page_end": batch_pages[-1]["page_number"],
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
                 "stop_reason": stop_reason, "retry_count": retry_depth,
-                "result": "失敗", "error": error
+                "result": "失敗", "error": error, "output_characters": len(markdown)
             })
             if retry_depth >= max_retries:
                 raise ValueError(
@@ -1307,28 +1429,70 @@ def convert_pdf_text_to_markdown(pdf_text: str, model_id: str, pages_per_batch: 
                 batch_pages, initial_batch_index, previous_context, retry_depth + 1
             )
 
-    def build_metrics(page_markers_complete: bool) -> dict:
-        return {
+    def build_metrics(page_markers_complete: bool, coverage: Optional[dict] = None,
+                      markdown: str = "") -> dict:
+        coverage = coverage or {}
+        page_sections = coverage.get("page_sections", {})
+        page_character_metrics = []
+        short_page_warnings = []
+        for page in pages:
+            input_count = len(page["text"])
+            output_count = len(page_sections.get(page["page_number"], ""))
+            ratio = round(output_count / input_count, 3) if input_count else None
+            warning = bool(input_count >= 200 and output_count < max(50, input_count * 0.1))
+            if warning:
+                short_page_warnings.append(page["page_number"])
+            page_character_metrics.append({
+                "page_number": page["page_number"], "input_characters": input_count,
+                "output_characters": output_count, "output_input_ratio": ratio,
+                "extremely_short_warning": warning
+            })
+        metrics = {
             "page_count": len(pages), "pages_per_batch": pages_per_batch,
             "batch_count": sum(metric["result"] == "成功" for metric in batch_metrics),
             "batch_metrics": batch_metrics, "retry_count": retry_count,
             "stop_reason": batch_metrics[-1]["stop_reason"] if batch_metrics else "",
             "page_markers_complete": page_markers_complete,
+            "page_marker_count": coverage.get("page_marker_count", 0),
+            "expected_page_count": len(pages),
+            "missing_page_numbers": coverage.get("missing_page_numbers", []),
+            "duplicate_page_numbers": coverage.get("duplicate_page_numbers", []),
+            "unexpected_page_numbers": coverage.get("unexpected_page_numbers", []),
+            "page_marker_order_valid": coverage.get("page_marker_order_valid", False),
+            "page_marker_normalization_count": page_marker_normalization_count,
+            "last_page_number": coverage.get("last_page_number"),
+            "last_page_has_content": coverage.get("last_page_has_content", False),
+            "empty_page_numbers": coverage.get("empty_page_numbers", []),
+            "unresolved_max_tokens": not page_markers_complete and any(
+                item["result"] == "失敗" and item["stop_reason"] == "max_tokens"
+                for item in batch_metrics
+            ),
+            "empty_batch_count": sum(
+                item["result"] == "成功" and item.get("output_characters", 0) == 0
+                for item in batch_metrics
+            ),
+            "output_character_count": len(markdown),
+            "page_character_metrics": page_character_metrics,
+            "extremely_short_page_warnings": short_page_warnings,
             "total_elapsed_ms": round((time.perf_counter() - total_started) * 1000, 1)
         }
+        return metrics
 
     try:
         for batch_index, batch_pages in enumerate(initial_batches, start=1):
             previous_context = outputs[-1][-1500:] if outputs else "なし"
             outputs.extend(process_batch(batch_pages, batch_index, previous_context))
         markdown = "\n\n".join(outputs).strip()
-        validate_markdown_page_coverage(markdown, pages)
-        metrics = build_metrics(True)
+        coverage = validate_markdown_page_coverage(markdown, pages)
+        metrics = build_metrics(True, coverage, markdown)
         metrics["stop_reason"] = "end_turn"
         return markdown, metrics
     except Exception as exc:
         wrapped = ValueError(str(exc))
-        wrapped.metrics = build_metrics(False)
+        coverage = getattr(exc, "coverage_metrics", None)
+        if coverage is None:
+            coverage = analyze_markdown_page_coverage("\n\n".join(outputs), pages)
+        wrapped.metrics = build_metrics(False, coverage, "\n\n".join(outputs))
         raise wrapped from exc
 
 
@@ -2861,7 +3025,14 @@ elif page == "🧪 データ取り込み検証":
                                         pdf_text, markdown_model_id
                                     )
                                     markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
-                                    selected_formats.append(("FILE_MARKDOWN", "markdown", "source.md", markdown_text, None, extraction_ms + markdown_ms))
+                                    markdown_allowed, markdown_guard_reasons = markdown_s3_upload_allowed(
+                                        markdown_metrics
+                                    )
+                                    selected_formats.append((
+                                        "FILE_MARKDOWN", "markdown", "source.md", markdown_text,
+                                        None if markdown_allowed else " / ".join(markdown_guard_reasons),
+                                        extraction_ms + markdown_ms
+                                    ))
                                 except Exception as exc:
                                     markdown_ms = round((time.perf_counter() - markdown_started) * 1000, 1)
                                     markdown_metrics = getattr(exc, "metrics", {})
@@ -2889,7 +3060,9 @@ elif page == "🧪 データ取り込み検証":
                             if error:
                                 results.append({
                                     "datasource_id": datasource_id, "元ファイル名 / URL": original_name,
-                                    "生成形式": config_name, "文字数": 0, "PDF抽出時間(ms)": extraction_ms,
+                                    "生成形式": config_name,
+                                    "文字数": len(content) if isinstance(content, str) else 0,
+                                    "PDF抽出時間(ms)": extraction_ms,
                                     "Markdown変換時間(ms)": markdown_ms,
                                     "Vision Markdown変換時間(ms)": (
                                         vision_markdown_ms if config_name == "FILE_VISION_MARKDOWN" else 0
@@ -2900,7 +3073,10 @@ elif page == "🧪 データ取り込み検証":
                                 if config_name == "FILE_MARKDOWN" and markdown_metrics:
                                     previews.append({
                                         "datasource_id": datasource_id, "source": original_name,
-                                        "format": config_name, "count": 0, "metadata": {}, "text": "",
+                                        "format": config_name,
+                                        "count": len(content) if isinstance(content, str) else 0,
+                                        "metadata": {},
+                                        "text": content if isinstance(content, str) else "",
                                         "result": "失敗", "markdown_metrics": markdown_metrics,
                                         "vision_metrics": {}
                                     })
@@ -2948,7 +3124,7 @@ elif page == "🧪 データ取り込み検証":
                                     "metadata": metadata,
                                     "text": (
                                         content[:20000] if config_name == "FILE_VISION_MARKDOWN"
-                                        else content[:5000]
+                                        else content
                                     ) if isinstance(content, str) else "",
                                     "result": "失敗",
                                     "markdown_metrics": markdown_metrics if config_name == "FILE_MARKDOWN" else {},
@@ -2970,7 +3146,7 @@ elif page == "🧪 データ取り込み検証":
                                 "metadata": metadata,
                                 "text": (
                                     content[:20000] if config_name == "FILE_VISION_MARKDOWN"
-                                    else content[:5000]
+                                    else content
                                 ) if isinstance(content, str) else "",
                                 "result": "成功",
                                 "markdown_metrics": markdown_metrics if config_name == "FILE_MARKDOWN" else {},
@@ -3000,14 +3176,21 @@ elif page == "🧪 データ取り込み検証":
                     if preview["metadata"]:
                         st.json(preview["metadata"])
                     if preview.get("markdown_metrics"):
+                        markdown_metrics_for_ui = preview["markdown_metrics"]
                         st.json({
-                            key: value for key, value in preview["markdown_metrics"].items()
-                            if key != "batch_metrics"
+                            key: value for key, value in markdown_metrics_for_ui.items()
+                            if key not in {"batch_metrics", "page_character_metrics", "page_sections"}
                         })
                         st.dataframe(
-                            pd.DataFrame(preview["markdown_metrics"].get("batch_metrics", [])),
+                            pd.DataFrame(markdown_metrics_for_ui.get("batch_metrics", [])),
                             use_container_width=True
                         )
+                        if markdown_metrics_for_ui.get("page_character_metrics"):
+                            st.markdown("**ページ別入出力文字数**")
+                            st.dataframe(
+                                pd.DataFrame(markdown_metrics_for_ui["page_character_metrics"]),
+                                use_container_width=True
+                            )
                     if preview.get("vision_metrics"):
                         st.json({
                             key: value for key, value in preview["vision_metrics"].items()
@@ -3018,7 +3201,82 @@ elif page == "🧪 データ取り込み検証":
                             use_container_width=True
                         )
                     if preview["text"]:
-                        if preview["format"] in {"FILE_MARKDOWN", "FILE_VISION_MARKDOWN"}:
+                        if preview["format"] == "FILE_MARKDOWN":
+                            markdown_text = preview["text"]
+                            metrics = preview.get("markdown_metrics", {})
+                            upload_allowed, upload_reasons = markdown_s3_upload_allowed(metrics)
+                            st.markdown("### 通常Markdown完全性チェック")
+                            completeness_rows = [
+                                {"チェック項目": "全ページマーカー", "結果": "OK" if metrics.get("page_markers_complete") else "NG"},
+                                {"チェック項目": "ページ数", "結果": f"{metrics.get('page_marker_count', 0)} / {metrics.get('expected_page_count', 0)}"},
+                                {"チェック項目": "欠落ページ", "結果": metrics.get("missing_page_numbers") or "なし"},
+                                {"チェック項目": "重複ページ", "結果": metrics.get("duplicate_page_numbers") or "なし"},
+                                {"チェック項目": "想定外ページ", "結果": metrics.get("unexpected_page_numbers") or "なし"},
+                                {"チェック項目": "最終ページ", "結果": f"page {metrics.get('last_page_number')}"},
+                                {"チェック項目": "最終ページ本文", "結果": "あり" if metrics.get("last_page_has_content") else "なし"},
+                                {"チェック項目": "未解決max_tokens", "結果": "あり" if metrics.get("unresolved_max_tokens") else "なし"},
+                                {"チェック項目": "空バッチ", "結果": metrics.get("empty_batch_count", 0) or "なし"},
+                                {"チェック項目": "空ページ", "結果": metrics.get("empty_page_numbers") or "なし"},
+                                {"チェック項目": "出力全文字数", "結果": len(markdown_text)},
+                            ]
+                            st.dataframe(pd.DataFrame(completeness_rows), use_container_width=True)
+                            if upload_allowed and preview.get("result") == "成功":
+                                st.success("FILE_MARKDOWNは完全性検証に合格しました。S3へアップロードできます。")
+                            else:
+                                st.error("FILE_MARKDOWNはS3へアップロードできません。")
+                                for reason in upload_reasons:
+                                    st.warning(reason)
+                            if metrics.get("extremely_short_page_warnings"):
+                                st.warning(
+                                    "入力に対して出力が極端に短い可能性があるページ: "
+                                    + ", ".join(map(str, metrics["extremely_short_page_warnings"]))
+                                )
+
+                            regression_terms = [
+                                ("120,000円", ["120,000円"]),
+                                ("10,000円単位", ["10,000円単位"]),
+                                ("機関保証", ["機関保証"]), ("人的保証", ["人的保証"]),
+                                ("7か月目 / ７か月目", ["7か月目", "７か月目"]),
+                                ("同年10月", ["同年10月"]),
+                                ("入学時特別増額貸与奨学金", ["入学時特別増額貸与奨学金"]),
+                                ("奨学金理解度チェック", ["奨学金理解度チェック"]),
+                            ]
+                            st.markdown("**JASSO回帰確認用語句（S3可否には使用しません）**")
+                            st.dataframe(pd.DataFrame([
+                                {"語句": label, "結果": "あり" if any(term in markdown_text for term in alternatives) else "なし"}
+                                for label, alternatives in regression_terms
+                            ]), use_container_width=True)
+
+                            st.caption("全文レンダリングは維持しています。ブラウザ描画上、長文の後半を確認しづらい場合は末尾・ページ別プレビューを利用してください。")
+                            st.markdown(preview["text"])
+                            st.text_area(
+                                "通常Markdown先頭", markdown_text[:5000], height=300,
+                                disabled=True, key=f"markdown_head_{preview['datasource_id']}"
+                            )
+                            st.text_area(
+                                "通常Markdown末尾", markdown_text[-5000:], height=500,
+                                disabled=True, key=f"markdown_tail_{preview['datasource_id']}"
+                            )
+                            markdown_pages = split_markdown_by_page(markdown_text)
+                            if markdown_pages:
+                                selected_page = st.selectbox(
+                                    "プレビューするページ", list(markdown_pages),
+                                    index=len(markdown_pages) - 1,
+                                    key=f"markdown_page_{preview['datasource_id']}"
+                                )
+                                st.text_area(
+                                    f"page {selected_page}", markdown_pages[selected_page],
+                                    height=500, disabled=True,
+                                    key=f"markdown_page_text_{preview['datasource_id']}"
+                                )
+                            st.download_button(
+                                "通常Markdown本体をダウンロード",
+                                markdown_text.encode("utf-8"),
+                                pdf_comparison_source_file_name("FILE_MARKDOWN", preview["source"]),
+                                "text/markdown; charset=utf-8",
+                                key=f"download_markdown_{preview['datasource_id']}"
+                            )
+                        elif preview["format"] == "FILE_VISION_MARKDOWN":
                             st.markdown(preview["text"])
                         else:
                             st.text(preview["text"])
