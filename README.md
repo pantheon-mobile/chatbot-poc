@@ -140,6 +140,9 @@ Overlap 60 tokensに手動設定してください。画面上の確認チェッ
 |---|---|---|---|---|
 | `boto3.client("s3")` | `head_object` | `s3:GetObject` | `arn:aws:s3:::<BUCKET>/documents/ingestion-test/*` | 上書き防止 |
 | `boto3.client("s3")` | `put_object` | `s3:PutObject` | `arn:aws:s3:::<BUCKET>/documents/ingestion-test/*` | 成果物配置 |
+| `boto3.client("s3")` | `put_object` | `s3:PutObject` | `arn:aws:s3:::<BUCKET>/evaluation-history/*` | 評価履歴・手動レビュー保存 |
+| `boto3.client("s3")` | `get_object` | `s3:GetObject` | `arn:aws:s3:::<BUCKET>/evaluation-history/*` | 評価履歴詳細読込 |
+| `boto3.client("s3")` | `list_objects_v2` | `s3:ListBucket` | `arn:aws:s3:::<BUCKET>` | `evaluation-history/`の履歴一覧取得 |
 | `boto3.client("bedrock-agent")` | `start_ingestion_job` | `bedrock:StartIngestionJob` | 検証用Knowledge Base ARN | 同期開始 |
 | `boto3.client("bedrock-agent")` | `get_ingestion_job` | `bedrock:GetIngestionJob` | 検証用Knowledge Base ARN | 同期状態取得 |
 | `boto3.client("bedrock-agent")` | `list_ingestion_jobs` | `bedrock:ListIngestionJobs` | 検証用Knowledge Base ARN | AWS上の最新同期状態取得 |
@@ -160,6 +163,23 @@ PoC実行ロールの最小ポリシー例です。`<...>`は実リソースへ�
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::<BUCKET>/documents/ingestion-test/*"
+    },
+    {
+      "Sid": "ListEvaluationHistory",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<BUCKET>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["evaluation-history", "evaluation-history/*"]
+        }
+      }
+    },
+    {
+      "Sid": "ReadWriteEvaluationHistory",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::<BUCKET>/evaluation-history/*"
     },
     {
       "Sid": "TestKnowledgeBases",
@@ -191,6 +211,10 @@ PoC実行ロールの最小ポリシー例です。`<...>`は実リソースへ�
   ]
 }
 ```
+
+`evaluation-history/`は評価履歴専用です。Knowledge Base Data Sourceのinclusion prefixには
+`documents/ingestion-test/kb-source/`だけを指定し、`evaluation-history/`を取り込み対象へ含めないでください。
+履歴削除機能は実装していないため、PoC実行ロールに`s3:DeleteObject`は不要です。
 
 Knowledge Baseサービスロールの最小ポリシー例です。OpenSearch Serverless利用時の例であり、
 別のベクトルストアでは最後のStatementをそのサービス用権限へ置き換えます。

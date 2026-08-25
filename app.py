@@ -282,6 +282,324 @@ INGESTION_WORD_REVIEW_COLUMNS = [
     "hyperlink_preservation", "header_footer_separation", "page_break_preservation",
     "footnote_preservation", "comment_preservation"
 ]
+EVALUATION_HISTORY_PREFIX = "evaluation-history/"
+EVALUATION_HISTORY_SCHEMA_VERSION = "1.0"
+MANUAL_JUDGMENT_SCORES = {"CORRECT": 1.0, "PARTIAL": 0.5, "INCORRECT": 0.0}
+
+
+def generate_evaluation_experiment_id(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    return f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def dataframe_csv_bom(frame: pd.DataFrame) -> bytes:
+    """未知列を含むDataFrame全体をExcel向けUTF-8 BOM付きCSVにする。"""
+    return frame.to_csv(index=False).encode("utf-8-sig")
+
+
+def apply_effective_manual_review(frame: pd.DataFrame) -> pd.DataFrame:
+    """自動判定を保持したまま、入力済み手動判定をeffective列へ反映する。"""
+    result = frame.copy()
+    if "auto_answer_judgment" not in result:
+        result["auto_answer_judgment"] = result.get("answer_judgment", "")
+    if "auto_answer_score" not in result:
+        result["auto_answer_score"] = result.get("answer_score", None)
+    defaults = {
+        "manual_answer_judgment": "未確認", "manual_answer_score": None,
+        "manual_review_comment": "", "manual_reviewer": "", "manual_reviewed_at": ""
+    }
+    for column, default in defaults.items():
+        if column not in result:
+            result[column] = default
+    manual = result["manual_answer_judgment"].fillna("").astype(str).str.upper()
+    has_manual = manual.isin(MANUAL_JUDGMENT_SCORES)
+    result["manual_answer_score"] = [
+        MANUAL_JUDGMENT_SCORES.get(value) if enabled else None
+        for value, enabled in zip(manual, has_manual)
+    ]
+    result["effective_answer_judgment"] = result["auto_answer_judgment"]
+    result.loc[has_manual, "effective_answer_judgment"] = manual[has_manual]
+    result["effective_answer_score"] = pd.to_numeric(
+        result["auto_answer_score"], errors="coerce"
+    ).astype(float)
+    result.loc[has_manual, "effective_answer_score"] = result.loc[has_manual, "manual_answer_score"]
+    return result
+
+
+def collect_pdf_conversion_metrics(pdf_output: dict) -> dict:
+    """Session Stateに存在する方式別変換メトリクスを履歴保存用に抽出する。"""
+    metrics = {}
+    allowed_keys = {
+        "page_count", "page_marker_count", "page_markers_complete",
+        "missing_page_numbers", "duplicate_page_numbers", "unexpected_page_numbers",
+        "last_page_number", "last_page_has_content", "empty_page_numbers",
+        "output_character_count", "batch_count", "retry_count", "stop_reason",
+        "total_elapsed_ms"
+    }
+    for preview in (pdf_output or {}).get("previews", []):
+        format_name = preview.get("format")
+        source = preview.get("markdown_metrics") or preview.get("vision_metrics") or {}
+        if format_name and source:
+            metrics[format_name] = {key: source.get(key) for key in allowed_keys}
+    return metrics
+
+
+def build_evaluation_history_metadata(experiment_id: str, experiment_info: dict,
+                                      evaluation: dict, config: dict,
+                                      answer_model_id: str, evaluation_model_id: str,
+                                      maximum_tokens: int, top_k: int,
+                                      status: str = "COMPLETE") -> dict:
+    comparison = evaluation.get("comparison", pd.DataFrame())
+    formats = list(dict.fromkeys(comparison.get("ingestion_format", pd.Series(dtype=str)).dropna().astype(str)))
+    return {
+        "schema_version": EVALUATION_HISTORY_SCHEMA_VERSION,
+        "experiment_id": experiment_id,
+        "experiment_name": experiment_info.get("experiment_name", ""),
+        "experiment_memo": experiment_info.get("experiment_memo", ""),
+        "executed_at": experiment_info.get("executed_at") or datetime.now().isoformat(),
+        "executed_by": experiment_info.get("executed_by", ""),
+        "source_pdf_name": experiment_info.get("source_pdf_name", ""),
+        "evaluation_csv_name": experiment_info.get("evaluation_csv_name", ""),
+        "question_count": int(comparison["question"].nunique()) if "question" in comparison else 0,
+        "target_formats": formats,
+        "aws_region": "ap-northeast-1", "answer_model_id": answer_model_id,
+        "evaluation_model_id": evaluation_model_id, "maximum_tokens": int(maximum_tokens),
+        "temperature": 0, "top_k": int(top_k),
+        "chunking_strategy": "Hierarchical Chunking",
+        "parent_chunk_tokens": 1500, "child_chunk_tokens": 300, "overlap_tokens": 60,
+        "knowledge_bases": {name: config.get(name, {}).get("knowledge_base_id", "") for name in formats},
+        "data_sources": {name: config.get(name, {}).get("data_source_id", "") for name in formats},
+        "format_accuracy": {
+            str(row.get("ingestion_format")): row.get("accuracy")
+            for row in evaluation.get("accuracy_summary", pd.DataFrame()).to_dict("records")
+        },
+        "status": status
+    }
+
+
+def build_evaluation_history_files(evaluation: dict, questions: pd.DataFrame,
+                                   conversion_metrics: dict) -> dict[str, tuple[bytes, str]]:
+    """metadata以外の履歴保存ファイルを構築する。"""
+    comparison = evaluation.get("comparison", pd.DataFrame())
+    files = {
+        "input/evaluation_questions.csv": (dataframe_csv_bom(questions), "text/csv"),
+        "results/question_comparison.csv": (dataframe_csv_bom(comparison), "text/csv"),
+        "results/format_summary.csv": (dataframe_csv_bom(evaluation.get("accuracy_summary", pd.DataFrame())), "text/csv"),
+        "results/category_summary.csv": (dataframe_csv_bom(evaluation.get("category_summary", pd.DataFrame())), "text/csv"),
+        "results/difficulty_summary.csv": (dataframe_csv_bom(evaluation.get("difficulty_summary", pd.DataFrame())), "text/csv"),
+        "results/retrieval_detail.csv": (dataframe_csv_bom(evaluation.get("detail", pd.DataFrame())), "text/csv"),
+        "results/conversion_metrics.json": (
+            json.dumps(conversion_metrics, ensure_ascii=False, indent=2).encode("utf-8"),
+            "application/json"
+        )
+    }
+    review_columns = [
+        column for column in [
+            "question_id", "question", "ingestion_format", "auto_answer_judgment",
+            "auto_answer_score", "manual_answer_judgment", "manual_answer_score",
+            "manual_review_comment", "manual_reviewer", "manual_reviewed_at",
+            "effective_answer_judgment", "effective_answer_score"
+        ] if column in comparison.columns
+    ]
+    files["results/manual_review.csv"] = (
+        dataframe_csv_bom(comparison[review_columns] if review_columns else pd.DataFrame()),
+        "text/csv"
+    )
+    return files
+
+
+def save_evaluation_history(bucket: str, experiment_id: str, metadata: dict,
+                            files: dict, s3=None) -> list[dict]:
+    """履歴ファイルを個別保存し、部分失敗時はmetadataをINCOMPLETEにする。"""
+    if not bucket.strip():
+        raise ValueError("S3バケット名が未設定です。")
+    s3 = s3 or create_aws_client("s3")
+    prefix = f"{EVALUATION_HISTORY_PREFIX}{experiment_id}/"
+    rows = []
+    for relative_key, (body, content_type) in files.items():
+        key = prefix + relative_key
+        try:
+            s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
+            rows.append({"ファイル": relative_key, "S3 Key": key, "結果": "成功", "エラー内容": ""})
+        except Exception as exc:
+            rows.append({"ファイル": relative_key, "S3 Key": key, "結果": "失敗", "エラー内容": str(exc)})
+    metadata_to_save = {**metadata, "status": "COMPLETE" if all(row["結果"] == "成功" for row in rows) else "INCOMPLETE"}
+    metadata_key = prefix + "metadata.json"
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=metadata_key,
+            Body=json.dumps(metadata_to_save, ensure_ascii=False, indent=2).encode("utf-8"),
+            ContentType="application/json"
+        )
+        rows.append({"ファイル": "metadata.json", "S3 Key": metadata_key, "結果": "成功", "エラー内容": ""})
+    except Exception as exc:
+        rows.append({"ファイル": "metadata.json", "S3 Key": metadata_key, "結果": "失敗", "エラー内容": str(exc)})
+    return rows
+
+
+EVALUATION_HISTORY_REQUIRED_FILES = {
+    "metadata.json", "input/evaluation_questions.csv",
+    "results/question_comparison.csv", "results/format_summary.csv",
+    "results/category_summary.csv", "results/difficulty_summary.csv",
+    "results/retrieval_detail.csv", "results/conversion_metrics.json"
+}
+
+
+def list_evaluation_histories(bucket: str, s3=None) -> list[dict]:
+    """壊れた1件を隔離しつつ、S3履歴metadataを新しい順に読む。"""
+    s3 = s3 or create_aws_client("s3")
+    object_keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=EVALUATION_HISTORY_PREFIX):
+        object_keys.extend(item["Key"] for item in page.get("Contents", []))
+    keys_by_experiment = {}
+    for key in object_keys:
+        relative = key[len(EVALUATION_HISTORY_PREFIX):]
+        if "/" not in relative:
+            continue
+        experiment_id, file_name = relative.split("/", 1)
+        keys_by_experiment.setdefault(experiment_id, set()).add(file_name)
+    histories = []
+    for experiment_id, file_names in keys_by_experiment.items():
+        if "metadata.json" not in file_names:
+            histories.append({
+                "experiment_id": experiment_id, "executed_at": "", "experiment_name": "",
+                "source_pdf_name": "", "question_count": 0, "target_formats": [],
+                "format_accuracy": {}, "status": "INCOMPLETE", "history_error": "metadata.jsonがありません。"
+            })
+            continue
+        try:
+            response = s3.get_object(
+                Bucket=bucket, Key=f"{EVALUATION_HISTORY_PREFIX}{experiment_id}/metadata.json"
+            )
+            metadata = json.loads(response["Body"].read().decode("utf-8"))
+            missing = sorted(EVALUATION_HISTORY_REQUIRED_FILES - file_names)
+            metadata["experiment_id"] = metadata.get("experiment_id") or experiment_id
+            metadata["missing_files"] = missing
+            metadata["history_error"] = ""
+            if missing or metadata.get("status") != "COMPLETE":
+                metadata["status"] = "INCOMPLETE"
+            histories.append(metadata)
+        except Exception as exc:
+            histories.append({
+                "experiment_id": experiment_id, "executed_at": "", "experiment_name": "",
+                "source_pdf_name": "", "question_count": 0, "target_formats": [],
+                "format_accuracy": {}, "status": "INCOMPLETE", "history_error": str(exc)
+            })
+    return sorted(histories, key=lambda item: str(item.get("executed_at", "")), reverse=True)
+
+
+def load_evaluation_history(bucket: str, experiment_id: str, s3=None) -> dict:
+    """選択履歴を読取専用データとしてロードする。欠損ファイルは空DataFrameにする。"""
+    s3 = s3 or create_aws_client("s3")
+    prefix = f"{EVALUATION_HISTORY_PREFIX}{experiment_id}/"
+    result = {"experiment_id": experiment_id, "errors": {}}
+    targets = {
+        "metadata": ("metadata.json", "json"),
+        "questions": ("input/evaluation_questions.csv", "csv"),
+        "comparison": ("results/question_comparison.csv", "csv"),
+        "accuracy_summary": ("results/format_summary.csv", "csv"),
+        "category_summary": ("results/category_summary.csv", "csv"),
+        "difficulty_summary": ("results/difficulty_summary.csv", "csv"),
+        "detail": ("results/retrieval_detail.csv", "csv"),
+        "manual_review": ("results/manual_review.csv", "csv"),
+        "conversion_metrics": ("results/conversion_metrics.json", "json")
+    }
+    for name, (relative_key, kind) in targets.items():
+        try:
+            body = s3.get_object(Bucket=bucket, Key=prefix + relative_key)["Body"].read()
+            result[name] = (
+                json.loads(body.decode("utf-8")) if kind == "json"
+                else pd.read_csv(io.BytesIO(body), encoding="utf-8-sig").fillna("")
+            )
+        except Exception as exc:
+            result[name] = {} if kind == "json" else pd.DataFrame()
+            result["errors"][relative_key] = str(exc)
+    return result
+
+
+def build_history_format_difference(base: pd.DataFrame, comparison: pd.DataFrame) -> pd.DataFrame:
+    """方式別サマリーを結合し、正答率などのポイント差を計算する。"""
+    if base.empty or comparison.empty:
+        return pd.DataFrame()
+    merged = base.merge(comparison, on="ingestion_format", how="outer", suffixes=("_base", "_comparison"))
+    for metric in [
+        "correct_count", "partial_count", "incorrect_count", "accuracy", "weighted_accuracy",
+        "average_top_score", "average_retrieval_ms", "average_generation_ms", "average_total_ms"
+    ]:
+        base_column, comparison_column = f"{metric}_base", f"{metric}_comparison"
+        if base_column in merged and comparison_column in merged:
+            merged[f"{metric}_difference"] = (
+                pd.to_numeric(merged[comparison_column], errors="coerce")
+                - pd.to_numeric(merged[base_column], errors="coerce")
+            )
+            if metric in {"accuracy", "weighted_accuracy"}:
+                merged[f"{metric}_difference_pt"] = merged[f"{metric}_difference"] * 100
+    return merged
+
+
+def build_history_question_difference(base: pd.DataFrame, comparison: pd.DataFrame) -> pd.DataFrame:
+    """question_id優先、質問文フォールバックで質問×方式の変化を抽出する。"""
+    if base.empty and comparison.empty:
+        return pd.DataFrame()
+    use_question_id = (
+        "question_id" in base and "question_id" in comparison
+        and base["question_id"].astype(str).str.strip().ne("").any()
+        and comparison["question_id"].astype(str).str.strip().ne("").any()
+    )
+    key = "question_id" if use_question_id else "question"
+    join_columns = [key, "ingestion_format"]
+    merged = base.merge(comparison, on=join_columns, how="outer", suffixes=("_base", "_comparison"), indicator=True)
+    rows = []
+    for _, row in merged.iterrows():
+        before = str(row.get("effective_answer_judgment_base") or row.get("answer_judgment_base") or "")
+        after = str(row.get("effective_answer_judgment_comparison") or row.get("answer_judgment_comparison") or "")
+        if row["_merge"] == "left_only":
+            change = "削除"
+        elif row["_merge"] == "right_only":
+            change = "追加"
+        elif before in {"INCORRECT", "PARTIAL"} and after == "CORRECT":
+            change = "改善"
+        elif before == "CORRECT" and after in {"PARTIAL", "INCORRECT"}:
+            change = "悪化"
+        elif before != after:
+            change = "判定変更"
+        else:
+            change = "変更なし"
+        rows.append({
+            key: row.get(key), "ingestion_format": row.get("ingestion_format"),
+            "base_judgment": before, "comparison_judgment": after, "change": change,
+            "answer_changed": str(row.get("answer_base", "")) != str(row.get("answer_comparison", "")),
+            "top_score_difference": pd.to_numeric(row.get("top_retrieval_score_comparison"), errors="coerce") - pd.to_numeric(row.get("top_retrieval_score_base"), errors="coerce"),
+            "chunk_rank_difference": pd.to_numeric(row.get("correct_chunk_rank_comparison"), errors="coerce") - pd.to_numeric(row.get("correct_chunk_rank_base"), errors="coerce"),
+            "base_error": row.get("evaluation_error_base", ""),
+            "comparison_error": row.get("evaluation_error_comparison", "")
+        })
+    return pd.DataFrame(rows)
+
+
+def recommend_ingestion_formats(summary: pd.DataFrame) -> dict:
+    """エラー、不正解、加重正答率、正答率、処理時間の順で推奨方式を選ぶ。"""
+    if summary.empty:
+        return {"formats": [], "reason": "集計結果がありません。"}
+    ranked = summary.copy()
+    for column, default in {
+        "evaluation_error_count": float("inf"), "incorrect_count": float("inf"),
+        "weighted_accuracy": -1, "accuracy": -1, "average_total_ms": float("inf")
+    }.items():
+        values = ranked[column] if column in ranked else pd.Series(default, index=ranked.index)
+        ranked[column] = pd.to_numeric(values, errors="coerce").fillna(default)
+    sort_columns = ["evaluation_error_count", "incorrect_count", "weighted_accuracy", "accuracy", "average_total_ms"]
+    ranked = ranked.sort_values(sort_columns, ascending=[True, True, False, False, True])
+    best = ranked.iloc[0]
+    tied = ranked[
+        (ranked["evaluation_error_count"] == best["evaluation_error_count"])
+        & (ranked["incorrect_count"] == best["incorrect_count"])
+        & (ranked["weighted_accuracy"] == best["weighted_accuracy"])
+        & (ranked["accuracy"] == best["accuracy"])
+        & (ranked["average_total_ms"] == best["average_total_ms"])
+    ]
+    return {"formats": tied["ingestion_format"].astype(str).tolist(), "row": best.to_dict()}
 
 
 def generate_datasource_id() -> str:
@@ -1088,7 +1406,7 @@ def build_ingestion_accuracy_summary(comparison: pd.DataFrame,
     columns = [
         *group_columns, "question_count", "correct_count", "partial_count",
         "incorrect_count", "evaluation_error_count", "accuracy", "weighted_accuracy",
-        "average_top_score", "average_total_ms"
+        "average_top_score", "average_retrieval_ms", "average_generation_ms", "average_total_ms"
     ]
     if comparison.empty or any(column not in comparison.columns for column in group_columns):
         return pd.DataFrame(columns=columns)
@@ -1105,6 +1423,8 @@ def build_ingestion_accuracy_summary(comparison: pd.DataFrame,
             "question_count": len(group),
             **accuracy,
             "average_top_score": pd.to_numeric(group["top_retrieval_score"], errors="coerce").mean(),
+            "average_retrieval_ms": pd.to_numeric(group["retrieval_elapsed_ms"], errors="coerce").mean(),
+            "average_generation_ms": pd.to_numeric(group["generation_elapsed_ms"], errors="coerce").mean(),
             "average_total_ms": pd.to_numeric(group["total_elapsed_ms"], errors="coerce").mean()
         })
     return pd.DataFrame(rows, columns=columns)
@@ -4064,6 +4384,39 @@ elif page == "🧪 データ取り込み検証":
             st.error(f"評価質問CSVの読み込みに失敗しました: {exc}")
             st.code(traceback.format_exc())
 
+    st.markdown("### 評価実験情報")
+    latest_pdf_previews = st.session_state.get("ingestion_pdf_output", {}).get("previews", [])
+    default_source_pdf = latest_pdf_previews[0].get("source", "") if latest_pdf_previews else ""
+    if ("evaluation_source_pdf_name" not in st.session_state
+            or not st.session_state.evaluation_source_pdf_name) and default_source_pdf:
+        st.session_state.evaluation_source_pdf_name = default_source_pdf
+    if ("evaluation_csv_name" not in st.session_state
+            or not st.session_state.evaluation_csv_name) and evaluation_csv is not None:
+        st.session_state.evaluation_csv_name = evaluation_csv.name
+    if ("evaluation_experiment_name" not in st.session_state
+            or re.fullmatch(r"evaluation_\d{8}_\d{6}", st.session_state.evaluation_experiment_name or "")):
+        source_stem = os.path.splitext(default_source_pdf)[0] or "evaluation"
+        st.session_state.evaluation_experiment_name = (
+            f"{source_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+    experiment_col1, experiment_col2 = st.columns(2)
+    experiment_name = experiment_col1.text_input("実験名", key="evaluation_experiment_name")
+    source_pdf_name = experiment_col2.text_input(
+        "元PDF名", value=default_source_pdf, key="evaluation_source_pdf_name"
+    )
+    experiment_memo = st.text_area("実験メモ（任意）", key="evaluation_experiment_memo")
+    experiment_col3, experiment_col4, experiment_col5 = st.columns(3)
+    experiment_target_formats = experiment_col3.multiselect(
+        "評価対象方式", INGESTION_ALL_FORMATS, default=list(INGESTION_FILE_FORMATS),
+        key="evaluation_target_formats"
+    )
+    evaluation_csv_name = experiment_col4.text_input(
+        "評価質問CSV名",
+        value=evaluation_csv.name if evaluation_csv is not None else "",
+        key="evaluation_csv_name"
+    )
+    executed_by = experiment_col5.text_input("実行者名（任意）", key="evaluation_executed_by")
+
     st.info("比較前提: Hierarchical Chunking / Parent 1500 tokens / Child 300 tokens / Overlap 60 tokens")
     chunking_confirmed = st.checkbox(
         "PDF 4KB / Web 2KBが上記と同じChunking設定であることを確認しました",
@@ -4114,6 +4467,7 @@ elif page == "🧪 データ取り込み検証":
                 evaluation_model.strip(), evaluation_max_tokens,
                 progress_callback=progress.progress, status_callback=status_area.info
             )
+            comparison_df = apply_effective_manual_review(comparison_df)
             status_area.success("Retrieve・回答生成・自動採点が完了しました。")
             st.session_state[output_state] = {
                 "detail": detail_df, "comparison": comparison_df,
@@ -4127,8 +4481,21 @@ elif page == "🧪 データ取り込み検証":
                 "difficulty_summary": build_ingestion_accuracy_summary(
                     comparison_df, ["ingestion_format", "difficulty"]
                 ) if "difficulty" in evaluation_questions.columns else pd.DataFrame(),
-                "timestamp": datetime.now().strftime("%Y%m%d%H%M%S")
+                "timestamp": datetime.now().strftime("%Y%m%d%H%M%S"),
+                "questions_snapshot": evaluation_questions.copy(),
+                "experiment_info": {
+                    "experiment_name": experiment_name,
+                    "experiment_memo": experiment_memo,
+                    "executed_at": datetime.now().isoformat(), "executed_by": executed_by,
+                    "source_pdf_name": source_pdf_name,
+                    "evaluation_csv_name": evaluation_csv_name,
+                    "requested_target_formats": experiment_target_formats
+                }
             }
+            if output_state == "ingestion_file_evaluation":
+                st.session_state.current_ingestion_evaluation_results = st.session_state[output_state]
+                st.session_state.pop("saved_evaluation_experiment_id", None)
+                st.session_state.pop("evaluation_history_save_results", None)
 
     eval_col1, eval_col2, eval_col3, eval_col4 = st.columns(4)
     if eval_col1.button("ファイルRetrieve比較を実行", type="primary", key="run_file_ingestion_evaluation"):
@@ -4217,6 +4584,76 @@ elif page == "🧪 データ取り込み検証":
         else:
             st.dataframe(question_display, use_container_width=True)
 
+        recommendation = recommend_ingestion_formats(accuracy_summary)
+        if recommendation.get("formats"):
+            recommended_names = " / ".join(recommendation["formats"])
+            recommended_row = recommendation["row"]
+            st.success(f"総合推奨方式：{recommended_names}")
+            st.caption(
+                f"評価エラー {int(recommended_row.get('evaluation_error_count', 0))}件 / "
+                f"不正解 {int(recommended_row.get('incorrect_count', 0))}件 / "
+                f"加重正答率 {recommended_row.get('weighted_accuracy', 0):.1%} / "
+                f"正答率 {recommended_row.get('accuracy', 0):.1%} / "
+                f"平均総処理時間 {recommended_row.get('average_total_ms', 0):,.1f}ms"
+            )
+            if int(recommended_row.get("question_count", 0)) < 20:
+                st.warning("この推奨は今回の評価質問に対する結果です。異なる構造のPDFでも再評価してください。")
+
+        st.markdown(f"**{label} 手動レビュー**")
+        review_columns = [
+            column for column in [
+                "question_id", "question", "ingestion_format", "auto_answer_judgment",
+                "auto_answer_score", "manual_answer_judgment", "manual_review_comment",
+                "manual_reviewer", "manual_reviewed_at", "effective_answer_judgment",
+                "effective_answer_score"
+            ] if column in comparison_df.columns
+        ]
+        review_frame = comparison_df[review_columns].copy()
+        edited_review = st.data_editor(
+            review_frame, use_container_width=True, hide_index=False,
+            disabled=[column for column in review_columns if column not in {
+                "manual_answer_judgment", "manual_review_comment", "manual_reviewer"
+            }],
+            column_config={
+                "manual_answer_judgment": st.column_config.SelectboxColumn(
+                    "手動判定", options=["未確認", "CORRECT", "PARTIAL", "INCORRECT"]
+                )
+            },
+            key=f"manual_review_editor_{evaluation_state}"
+        )
+        if st.button("手動レビューを現在結果へ反映", key=f"apply_manual_review_{evaluation_state}"):
+            updated = comparison_df.copy()
+            for column in ["manual_answer_judgment", "manual_review_comment", "manual_reviewer"]:
+                if column in edited_review:
+                    updated.loc[edited_review.index, column] = edited_review[column]
+            reviewed = updated["manual_answer_judgment"].fillna("").astype(str).str.upper().isin(
+                MANUAL_JUDGMENT_SCORES
+            )
+            updated.loc[reviewed, "manual_reviewed_at"] = datetime.now().isoformat()
+            updated = apply_effective_manual_review(updated)
+            evaluation["comparison"] = updated
+            evaluation["accuracy_summary"] = build_ingestion_accuracy_summary(
+                updated.assign(
+                    answer_judgment=updated["effective_answer_judgment"],
+                    answer_score=updated["effective_answer_score"]
+                ), ["ingestion_format"]
+            )
+            effective_for_summary = updated.assign(
+                answer_judgment=updated["effective_answer_judgment"],
+                answer_score=updated["effective_answer_score"]
+            )
+            evaluation["category_summary"] = build_ingestion_accuracy_summary(
+                effective_for_summary, ["ingestion_format", "category"]
+            ) if "category" in updated else pd.DataFrame()
+            evaluation["difficulty_summary"] = build_ingestion_accuracy_summary(
+                effective_for_summary, ["ingestion_format", "difficulty"]
+            ) if "difficulty" in updated else pd.DataFrame()
+            st.session_state[evaluation_state] = evaluation
+            if evaluation_state == "ingestion_file_evaluation":
+                st.session_state.current_ingestion_evaluation_results = evaluation
+                st.session_state.pop("saved_evaluation_experiment_id", None)
+            st.success("手動レビューを反映しました。履歴保存時はmanual_review.csvへも保存します。")
+
         if not category_summary.empty:
             st.subheader(f"{label} カテゴリ別サマリー")
             category_display = category_summary.copy()
@@ -4270,6 +4707,225 @@ elif page == "🧪 データ取り込み検証":
                 f"{comparison_prefix}_difficulty_summary_{stamp}.csv", "text/csv",
                 key=f"download_{comparison_prefix}_difficulty_summary"
             )
+
+        if evaluation_state == "ingestion_file_evaluation":
+            st.markdown("### 評価結果のS3保存")
+            experiment_info = evaluation.get("experiment_info", {})
+            save_formats = list(dict.fromkeys(comparison_df["ingestion_format"].astype(str)))
+            save_preview = {
+                "実験名": experiment_info.get("experiment_name", ""),
+                "元PDF名": experiment_info.get("source_pdf_name", ""),
+                "質問数": int(comparison_df["question"].nunique()) if "question" in comparison_df else 0,
+                "対象方式": save_formats,
+                "保存先": f"s3://{ingestion_bucket}/{EVALUATION_HISTORY_PREFIX}<experiment_id>/"
+            }
+            st.json(save_preview)
+            already_saved = bool(st.session_state.get("saved_evaluation_experiment_id"))
+            if st.button(
+                "この評価結果をS3へ保存", type="primary",
+                disabled=already_saved, key="save_file_evaluation_history"
+            ):
+                if not ingestion_bucket.strip():
+                    st.error("S3バケット名が未設定です。")
+                elif not experiment_info.get("experiment_name", "").strip():
+                    st.error("実験名を入力してください。")
+                else:
+                    experiment_id = generate_evaluation_experiment_id()
+                    metadata = build_evaluation_history_metadata(
+                        experiment_id, experiment_info, evaluation, ingestion_test_config,
+                        evaluation_model.strip(), evaluation_model.strip(),
+                        evaluation_max_tokens, evaluation_top_k
+                    )
+                    files = build_evaluation_history_files(
+                        evaluation, evaluation.get("questions_snapshot", pd.DataFrame()),
+                        collect_pdf_conversion_metrics(st.session_state.get("ingestion_pdf_output", {}))
+                    )
+                    save_rows = save_evaluation_history(
+                        ingestion_bucket.strip(), experiment_id, metadata, files
+                    )
+                    st.session_state.evaluation_history_save_results = save_rows
+                    if all(row["結果"] == "成功" for row in save_rows):
+                        st.session_state.saved_evaluation_experiment_id = experiment_id
+                        st.success(
+                            f"実験ID {experiment_id} として保存しました: "
+                            f"s3://{ingestion_bucket}/{EVALUATION_HISTORY_PREFIX}{experiment_id}/"
+                        )
+                        st.session_state.pop("evaluation_history_list", None)
+                    else:
+                        st.error("一部ファイルの保存に失敗したため、実験はINCOMPLETEです。")
+            if already_saved:
+                st.info(f"保存済み実験ID: {st.session_state.saved_evaluation_experiment_id}")
+            if st.session_state.get("evaluation_history_save_results"):
+                st.dataframe(
+                    pd.DataFrame(st.session_state.evaluation_history_save_results),
+                    use_container_width=True
+                )
+
+    st.divider()
+    st.header("評価結果履歴")
+    st.caption(
+        f"履歴は s3://<bucket>/{EVALUATION_HISTORY_PREFIX} に保存します。"
+        "このprefixをKnowledge Base Data Sourceのinclusion prefixへ含めないでください。"
+    )
+    history_reload_col, history_more_col = st.columns(2)
+    if "evaluation_history_limit" not in st.session_state:
+        st.session_state.evaluation_history_limit = 20
+    if history_reload_col.button("AWSから履歴を再読み込み", key="reload_evaluation_histories"):
+        try:
+            st.session_state.evaluation_history_list = list_evaluation_histories(
+                ingestion_bucket.strip()
+            )
+            st.session_state.evaluation_history_error = ""
+        except Exception as exc:
+            st.session_state.evaluation_history_error = str(exc)
+            st.error(f"評価履歴の取得に失敗しました: {exc}")
+    if history_more_col.button("さらに20件表示", key="load_more_evaluation_histories"):
+        st.session_state.evaluation_history_limit += 20
+    if st.session_state.get("evaluation_history_error"):
+        st.warning("履歴取得に失敗していますが、現在の評価機能は引き続き利用できます。")
+
+    history_list = st.session_state.get("evaluation_history_list", [])
+    visible_histories = history_list[:st.session_state.evaluation_history_limit]
+    if visible_histories:
+        st.dataframe(pd.DataFrame([{
+            "実行日時": item.get("executed_at", ""), "実験名": item.get("experiment_name", ""),
+            "元PDF名": item.get("source_pdf_name", ""), "質問数": item.get("question_count", 0),
+            "対象方式": ", ".join(item.get("target_formats", [])),
+            "方式別正答率": json.dumps(item.get("format_accuracy", {}), ensure_ascii=False),
+            "実験ID": item.get("experiment_id", ""), "ステータス": item.get("status", "INCOMPLETE"),
+            "エラー": item.get("history_error", "")
+        } for item in visible_histories]), use_container_width=True)
+        history_ids = [item["experiment_id"] for item in visible_histories]
+        selected_history_id = st.selectbox("履歴詳細", history_ids, key="selected_history_id")
+        if st.button("選択履歴を詳細表示", key="load_selected_evaluation_history"):
+            try:
+                st.session_state.selected_evaluation_history = load_evaluation_history(
+                    ingestion_bucket.strip(), selected_history_id
+                )
+            except Exception as exc:
+                st.error(f"履歴詳細の取得に失敗しました: {exc}")
+
+        selected_history = st.session_state.get("selected_evaluation_history")
+        if selected_history:
+            st.subheader("履歴詳細（読み取り専用）")
+            st.json(selected_history.get("metadata", {}))
+            if selected_history.get("errors"):
+                st.warning("不足・読込失敗ファイルがあります。")
+                st.json(selected_history["errors"])
+            for data_key, title in [
+                ("questions", "評価質問スナップショット"),
+                ("accuracy_summary", "方式別回答精度サマリー"),
+                ("comparison", "質問単位比較"), ("category_summary", "カテゴリ別サマリー"),
+                ("difficulty_summary", "難易度別サマリー"),
+                ("detail", "Retrieve詳細・処理時間"),
+                ("manual_review", "手動レビュー"),
+            ]:
+                frame = selected_history.get(data_key, pd.DataFrame())
+                if isinstance(frame, pd.DataFrame) and not frame.empty:
+                    st.markdown(f"**{title}**")
+                    st.dataframe(frame, use_container_width=True)
+                    st.download_button(
+                        f"{title}CSVをダウンロード", dataframe_csv_bom(frame),
+                        f"{selected_history['experiment_id']}_{data_key}.csv", "text/csv",
+                        key=f"history_download_{data_key}"
+                    )
+            history_comparison_frame = selected_history.get("comparison", pd.DataFrame())
+            if isinstance(history_comparison_frame, pd.DataFrame) and not history_comparison_frame.empty:
+                st.markdown("**履歴の手動レビュー**")
+                history_review = apply_effective_manual_review(history_comparison_frame)
+                history_review_columns = [
+                    column for column in [
+                        "question_id", "question", "ingestion_format", "auto_answer_judgment",
+                        "manual_answer_judgment", "manual_review_comment", "manual_reviewer",
+                        "manual_reviewed_at", "effective_answer_judgment", "effective_answer_score"
+                    ] if column in history_review
+                ]
+                edited_history_review = st.data_editor(
+                    history_review[history_review_columns], use_container_width=True,
+                    disabled=[column for column in history_review_columns if column not in {
+                        "manual_answer_judgment", "manual_review_comment", "manual_reviewer"
+                    }],
+                    column_config={
+                        "manual_answer_judgment": st.column_config.SelectboxColumn(
+                            "手動判定", options=["未確認", "CORRECT", "PARTIAL", "INCORRECT"]
+                        )
+                    }, key="selected_history_manual_review_editor"
+                )
+                if st.button("手動レビューを別ファイルへ保存", key="save_history_manual_review"):
+                    try:
+                        for column in ["manual_answer_judgment", "manual_review_comment", "manual_reviewer"]:
+                            history_review.loc[edited_history_review.index, column] = edited_history_review[column]
+                        reviewed_mask = history_review["manual_answer_judgment"].fillna("").astype(str).str.upper().isin(
+                            MANUAL_JUDGMENT_SCORES
+                        )
+                        history_review.loc[reviewed_mask, "manual_reviewed_at"] = datetime.now().isoformat()
+                        history_review = apply_effective_manual_review(history_review)
+                        manual_columns = [column for column in history_review_columns if column in history_review]
+                        for column in ["manual_answer_score", "effective_answer_score"]:
+                            if column in history_review and column not in manual_columns:
+                                manual_columns.append(column)
+                        manual_key = (
+                            f"{EVALUATION_HISTORY_PREFIX}{selected_history['experiment_id']}/"
+                            "results/manual_review.csv"
+                        )
+                        create_aws_client("s3").put_object(
+                            Bucket=ingestion_bucket.strip(), Key=manual_key,
+                            Body=dataframe_csv_bom(history_review[manual_columns]),
+                            ContentType="text/csv"
+                        )
+                        selected_history["manual_review"] = history_review[manual_columns]
+                        st.session_state.selected_evaluation_history = selected_history
+                        st.success("元の評価結果を変更せず、results/manual_review.csvへ保存しました。")
+                    except Exception as exc:
+                        st.error(f"手動レビュー保存エラー: {exc}")
+            st.markdown("**変換完全性メトリクス**")
+            st.json(selected_history.get("conversion_metrics", {}))
+            st.download_button(
+                "変換完全性メトリクスJSONをダウンロード",
+                json.dumps(
+                    selected_history.get("conversion_metrics", {}),
+                    ensure_ascii=False, indent=2
+                ).encode("utf-8"),
+                f"{selected_history['experiment_id']}_conversion_metrics.json",
+                "application/json", key="history_download_conversion_metrics"
+            )
+
+        comparison_options = (["CURRENT"] if st.session_state.get("current_ingestion_evaluation_results") else []) + history_ids
+        if len(comparison_options) >= 2:
+            st.subheader("2実験の比較")
+            compare_col1, compare_col2 = st.columns(2)
+            base_id = compare_col1.selectbox("基準実験", comparison_options, key="history_base_id")
+            target_id = compare_col2.selectbox(
+                "比較対象実験", comparison_options,
+                index=1 if len(comparison_options) > 1 else 0, key="history_target_id"
+            )
+            if st.button("実験差分を表示", key="compare_evaluation_histories"):
+                try:
+                    def comparison_source(experiment_id):
+                        if experiment_id == "CURRENT":
+                            return st.session_state.current_ingestion_evaluation_results
+                        return load_evaluation_history(ingestion_bucket.strip(), experiment_id)
+                    base_result, target_result = comparison_source(base_id), comparison_source(target_id)
+                    format_difference = build_history_format_difference(
+                        base_result.get("accuracy_summary", pd.DataFrame()),
+                        target_result.get("accuracy_summary", pd.DataFrame())
+                    )
+                    question_difference = build_history_question_difference(
+                        base_result.get("comparison", pd.DataFrame()),
+                        target_result.get("comparison", pd.DataFrame())
+                    )
+                    st.session_state.evaluation_history_comparison = {
+                        "format": format_difference, "question": question_difference,
+                        "base": base_id, "target": target_id
+                    }
+                except Exception as exc:
+                    st.error(f"実験比較に失敗しました: {exc}")
+            history_comparison = st.session_state.get("evaluation_history_comparison")
+            if history_comparison:
+                st.markdown("**方式別差分（accuracy差分はポイント差）**")
+                st.dataframe(history_comparison["format"], use_container_width=True)
+                st.markdown("**質問単位差分**")
+                st.dataframe(history_comparison["question"], use_container_width=True)
 
 # ==========================================
 #  メニュー6：JASSO Q&A取得
