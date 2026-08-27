@@ -1,6 +1,8 @@
 import ast
+import hashlib
 import io
 import json
+import time
 import uuid
 import warnings
 from datetime import datetime
@@ -15,7 +17,9 @@ def _load(*names):
     tree = ast.parse(source)
     constants = {
         "EVALUATION_HISTORY_PREFIX", "EVALUATION_HISTORY_SCHEMA_VERSION",
-        "MANUAL_JUDGMENT_SCORES", "EVALUATION_HISTORY_REQUIRED_FILES"
+        "EVALUATION_CHECKPOINT_SCHEMA_VERSION", "MANUAL_JUDGMENT_SCORES",
+        "EVALUATION_HISTORY_REQUIRED_FILES", "INGESTION_MANUAL_REVIEW_COLUMNS",
+        "INGESTION_EXCEL_REVIEW_COLUMNS", "INGESTION_WORD_REVIEW_COLUMNS"
     }
     nodes = [
         node for node in tree.body
@@ -26,7 +30,7 @@ def _load(*names):
     ]
     namespace = {
         "pd": pd, "io": io, "json": json, "uuid": uuid, "datetime": datetime,
-        "Optional": Optional,
+        "Optional": Optional, "hashlib": hashlib, "time": time,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
     return namespace
@@ -95,6 +99,80 @@ def test_experiment_id_is_unique():
     ids = {ns["generate_evaluation_experiment_id"](datetime(2026, 8, 25, 15, 30, 12)) for _ in range(20)}
     assert len(ids) == 20
     assert all(value.startswith("20260825_153012_") and len(value.rsplit("_", 1)[1]) == 8 for value in ids)
+
+
+def test_checkpoint_round_trip_and_signature_mismatch():
+    ns = _load(
+        "build_evaluation_checkpoint_signature", "save_evaluation_checkpoint",
+        "load_evaluation_checkpoint"
+    )
+    questions = pd.DataFrame([{"question": "q1", "expected_answer": "a1"}])
+    config = {"FILE_PDF": {"knowledge_base_id": "KB", "data_source_id": "DS"}}
+    signature = ns["build_evaluation_checkpoint_signature"](
+        questions, config, "HYBRID", 5, "model", 1000
+    )
+    fake = FakeS3()
+    ns["save_evaluation_checkpoint"](
+        "bucket", "ingestion_file_evaluation", signature,
+        pd.DataFrame([{"_checkpoint_key": "1:FILE_PDF", "rank": 1}]),
+        pd.DataFrame([{"_checkpoint_key": "1:FILE_PDF", "question": "q1"}]),
+        1, 4, s3=fake
+    )
+    loaded = ns["load_evaluation_checkpoint"](
+        "bucket", "ingestion_file_evaluation", signature, s3=fake
+    )
+    assert loaded["completed"] == 1
+    assert loaded["status"] == "IN_PROGRESS"
+    assert loaded["comparison_df"].iloc[0]["_checkpoint_key"] == "1:FILE_PDF"
+    assert ns["load_evaluation_checkpoint"](
+        "bucket", "ingestion_file_evaluation", "different", s3=fake
+    ) is None
+
+
+def test_evaluation_resumes_only_missing_question_format_units():
+    ns = _load("evaluate_ingestion_questions")
+    calls = []
+    ns.update({
+        "create_aws_client": lambda name: object(),
+        "create_bedrock_runtime_client": lambda: object(),
+        "retrieve_ingestion_chunks": lambda question, kb, search, top_k, runtime: (
+            calls.append(kb) or [{
+                "content": {"text": "source"}, "score": 0.9,
+                "metadata": {"datasource_id": "DS"}
+            }], 1.0
+        ),
+        "generate_ingestion_answer": lambda *args: ("answer", 2.0),
+        "evaluate_generated_ingestion_answer": lambda *args: {
+            "answer_judgment": "CORRECT", "answer_score": 1.0,
+            "judgment_reason": "ok", "missing_points": [], "incorrect_points": [],
+            "evaluation_elapsed_ms": 3.0, "evaluation_error": ""
+        },
+        "_retrieval_source": lambda item: ("s3://source", "source.txt", "source.txt"),
+        "_retrieval_metadata": lambda item: item.get("metadata", {})
+    })
+    checkpoints = []
+    detail, comparison = ns["evaluate_ingestion_questions"](
+        pd.DataFrame([{"question": "q1", "expected_answer": "a1"}]),
+        {
+            "FILE_PDF": {"knowledge_base_id": "KB1"},
+            "FILE_TXT": {"knowledge_base_id": "KB2"}
+        },
+        "HYBRID", 5, "model", 1000,
+        checkpoint_callback=lambda d, c, done, total: checkpoints.append((done, total)),
+        initial_detail=pd.DataFrame([{
+            "_checkpoint_key": "1:FILE_PDF", "question": "q1",
+            "ingestion_format": "FILE_PDF"
+        }]),
+        initial_comparison=pd.DataFrame([{
+            "_checkpoint_key": "1:FILE_PDF", "question": "q1",
+            "ingestion_format": "FILE_PDF"
+        }])
+    )
+    assert calls == ["KB2"]
+    assert len(comparison) == 2
+    assert "_checkpoint_key" not in comparison.columns
+    assert "_checkpoint_key" not in detail.columns
+    assert checkpoints == [(2, 2)]
 
 
 def test_metadata_schema_and_bom_unknown_column_preservation():

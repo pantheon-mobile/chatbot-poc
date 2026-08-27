@@ -10,6 +10,7 @@ import re
 import os
 import time
 import uuid
+import hashlib
 from collections import Counter
 from datetime import datetime
 from typing import Optional
@@ -284,6 +285,7 @@ INGESTION_WORD_REVIEW_COLUMNS = [
 ]
 EVALUATION_HISTORY_PREFIX = "evaluation-history/"
 EVALUATION_HISTORY_SCHEMA_VERSION = "1.0"
+EVALUATION_CHECKPOINT_SCHEMA_VERSION = "1.0"
 MANUAL_JUDGMENT_SCORES = {"CORRECT": 1.0, "PARTIAL": 0.5, "INCORRECT": 0.0}
 
 
@@ -295,6 +297,73 @@ def generate_evaluation_experiment_id(now: Optional[datetime] = None) -> str:
 def dataframe_csv_bom(frame: pd.DataFrame) -> bytes:
     """未知列を含むDataFrame全体をExcel向けUTF-8 BOM付きCSVにする。"""
     return frame.to_csv(index=False).encode("utf-8-sig")
+
+
+def build_evaluation_checkpoint_signature(questions: pd.DataFrame, config: dict,
+                                          search_type: str, top_k: int,
+                                          model_id: str, max_tokens: int) -> str:
+    """同じ評価入力だけを再開するための安定した署名を作る。"""
+    config_snapshot = {
+        name: {
+            "knowledge_base_id": values.get("knowledge_base_id", ""),
+            "data_source_id": values.get("data_source_id", "")
+        }
+        for name, values in config.items()
+    }
+    digest = hashlib.sha256()
+    digest.update(questions.to_csv(index=False).encode("utf-8"))
+    digest.update(json.dumps({
+        "config": config_snapshot, "search_type": search_type,
+        "top_k": int(top_k), "model_id": model_id,
+        "max_tokens": int(max_tokens)
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def save_evaluation_checkpoint(bucket: str, output_state: str, signature: str,
+                               detail: pd.DataFrame, comparison: pd.DataFrame,
+                               completed: int, total: int, status: str = "IN_PROGRESS",
+                               experiment_info: Optional[dict] = None, s3=None) -> dict:
+    """評価途中結果を単一S3オブジェクトへ上書き保存する。"""
+    if not bucket.strip():
+        raise ValueError("S3バケット名が未設定です。")
+    s3 = s3 or create_aws_client("s3")
+    key = f"{EVALUATION_HISTORY_PREFIX}_checkpoints/{output_state}.json"
+    payload = {
+        "schema_version": EVALUATION_CHECKPOINT_SCHEMA_VERSION,
+        "output_state": output_state, "signature": signature,
+        "status": status, "completed": int(completed), "total": int(total),
+        "updated_at": datetime.now().isoformat(),
+        "experiment_info": experiment_info or {},
+        "detail": json.loads(detail.to_json(orient="records", force_ascii=False)),
+        "comparison": json.loads(comparison.to_json(orient="records", force_ascii=False))
+    }
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json"
+    )
+    return payload
+
+
+def load_evaluation_checkpoint(bucket: str, output_state: str, signature: str,
+                               s3=None) -> Optional[dict]:
+    """入力署名が一致する評価チェックポイントだけを復元する。"""
+    if not bucket.strip():
+        return None
+    s3 = s3 or create_aws_client("s3")
+    key = f"{EVALUATION_HISTORY_PREFIX}_checkpoints/{output_state}.json"
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return None
+    if (payload.get("schema_version") != EVALUATION_CHECKPOINT_SCHEMA_VERSION
+            or payload.get("signature") != signature):
+        return None
+    payload["detail_df"] = pd.DataFrame(payload.get("detail", []))
+    payload["comparison_df"] = pd.DataFrame(payload.get("comparison", []))
+    return payload
 
 
 def apply_effective_manual_review(frame: pd.DataFrame) -> pd.DataFrame:
@@ -466,6 +535,8 @@ def list_evaluation_histories(bucket: str, s3=None) -> list[dict]:
     keys_by_experiment = {}
     for key in object_keys:
         relative = key[len(EVALUATION_HISTORY_PREFIX):]
+        if relative.startswith("_checkpoints/"):
+            continue
         if "/" not in relative:
             continue
         experiment_id, file_name = relative.split("/", 1)
@@ -1268,12 +1339,25 @@ def retrieve_and_generate_ingestion_answer(question: str, values: dict, search_t
 
 def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_type: str,
                                  top_k: int, model_id: str, max_tokens: int,
-                                 progress_callback=None, status_callback=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                                 progress_callback=None, status_callback=None,
+                                 checkpoint_callback=None,
+                                 initial_detail: Optional[pd.DataFrame] = None,
+                                 initial_comparison: Optional[pd.DataFrame] = None
+                                 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     agent_runtime = create_aws_client("bedrock-agent-runtime")
     runtime = create_bedrock_runtime_client()
-    detail_rows, comparison_rows = [], []
+    detail_rows = (initial_detail.to_dict("records")
+                   if initial_detail is not None and not initial_detail.empty else [])
+    comparison_rows = (initial_comparison.to_dict("records")
+                       if initial_comparison is not None and not initial_comparison.empty else [])
+    completed_keys = {
+        str(row.get("_checkpoint_key", "")) for row in comparison_rows
+        if str(row.get("_checkpoint_key", ""))
+    }
     total = max(len(questions) * len(config), 1)
-    completed = 0
+    completed = len(completed_keys)
+    if progress_callback:
+        progress_callback(min(completed / total, 1.0))
     evaluation_started = time.perf_counter()
     for question_index, (_, question_row) in enumerate(questions.iterrows(), start=1):
         question_data = {
@@ -1287,6 +1371,9 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
         evaluation_note = str(question_row.get("evaluation_note", "") or "").strip()
         keywords = [item.strip() for item in str(question_row.get("expected_keywords", "") or "").split(",") if item.strip()]
         for format_name, values in config.items():
+            checkpoint_key = f"{question_index}:{format_name}"
+            if checkpoint_key in completed_keys:
+                continue
             total_started = time.perf_counter()
             retrieval_ms, generation_ms, answer = 0.0, 0.0, ""
             retrieved, combined_text, citations = [], "", []
@@ -1314,6 +1401,7 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
                         top_score = item.get("score")
                     citations.append(source_uri)
                     detail_rows.append({
+                        "_checkpoint_key": checkpoint_key,
                         "question": question, "ingestion_format": format_name,
                         "datasource_id": str(item_metadata.get("datasource_id", "")),
                         "knowledge_base_id": values["knowledge_base_id"], "search_type": search_type,
@@ -1348,6 +1436,7 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
                     model_id, max_tokens, runtime
                 )
             comparison_rows.append({
+                "_checkpoint_key": checkpoint_key,
                 **question_data,
                 "question": question, "ingestion_format": format_name,
                 "datasource_id": retrieved_datasource_id,
@@ -1380,7 +1469,16 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
             completed += 1
             if progress_callback:
                 progress_callback(completed / total)
-    return pd.DataFrame(detail_rows), pd.DataFrame(comparison_rows)
+            if checkpoint_callback:
+                checkpoint_callback(
+                    pd.DataFrame(detail_rows), pd.DataFrame(comparison_rows), completed, total
+                )
+    detail = pd.DataFrame(detail_rows)
+    comparison = pd.DataFrame(comparison_rows)
+    return (
+        detail.drop(columns=["_checkpoint_key"], errors="ignore"),
+        comparison.drop(columns=["_checkpoint_key"], errors="ignore")
+    )
 
 
 def build_ingestion_format_summary(comparison: pd.DataFrame) -> pd.DataFrame:
@@ -4441,6 +4539,11 @@ elif page == "🧪 データ取り込み検証":
         "Word専用3KBが上記と同じChunking設定であることを確認しました",
         key="ingestion_word_chunking_confirmed"
     )
+    force_new_evaluation = st.checkbox(
+        "保存済みの途中結果を使わず、新規評価として開始する",
+        value=False, key="force_new_ingestion_evaluation",
+        help="通常はオフのままにしてください。中断後は同じCSV・設定で再実行すると続きから再開します。"
+    )
 
     def run_evaluation_group(formats, output_state, chunking_ok):
         subset = {key: ingestion_test_config[key] for key in formats}
@@ -4470,14 +4573,73 @@ elif page == "🧪 データ取り込み検証":
         elif evaluation_questions is None or evaluation_questions.empty:
             st.error("questionを含む評価質問CSVをアップロードしてください。")
         else:
-            st.session_state.pop(output_state, None)
             progress = st.progress(0)
             status_area = st.empty()
-            detail_df, comparison_df = evaluate_ingestion_questions(
+            checkpoint_area = st.empty()
+            signature = build_evaluation_checkpoint_signature(
                 evaluation_questions, subset, evaluation_search_type, evaluation_top_k,
-                evaluation_model.strip(), evaluation_max_tokens,
-                progress_callback=progress.progress, status_callback=status_area.info
+                evaluation_model.strip(), evaluation_max_tokens
             )
+            checkpoint = None if force_new_evaluation else load_evaluation_checkpoint(
+                ingestion_bucket, output_state, signature
+            )
+            initial_detail = checkpoint.get("detail_df") if checkpoint else pd.DataFrame()
+            initial_comparison = checkpoint.get("comparison_df") if checkpoint else pd.DataFrame()
+            total_units = len(evaluation_questions) * len(subset)
+            experiment_info = {
+                "experiment_name": experiment_name,
+                "experiment_memo": experiment_memo,
+                "executed_at": datetime.now().isoformat(), "executed_by": executed_by,
+                "source_pdf_name": source_pdf_name,
+                "evaluation_csv_name": evaluation_csv_name,
+                "requested_target_formats": experiment_target_formats
+            }
+            checkpoint_errors = []
+
+            if checkpoint:
+                checkpoint_area.info(
+                    f"S3の評価結果を復元しました: {checkpoint.get('completed', 0)} / "
+                    f"{checkpoint.get('total', total_units)}件 / {checkpoint.get('status', 'IN_PROGRESS')}"
+                )
+
+            def save_checkpoint(detail, comparison, completed, total):
+                try:
+                    save_evaluation_checkpoint(
+                        ingestion_bucket, output_state, signature,
+                        detail, comparison, completed, total,
+                        experiment_info=experiment_info
+                    )
+                    checkpoint_area.info(
+                        f"途中結果をS3へ保存しました: {completed} / {total}件"
+                    )
+                except Exception as exc:
+                    checkpoint_errors.append(str(exc))
+                    checkpoint_area.warning(f"途中結果のS3保存に失敗しました: {exc}")
+
+            if checkpoint and checkpoint.get("status") == "COMPLETE":
+                detail_df, comparison_df = initial_detail, initial_comparison
+                progress.progress(1.0)
+                status_area.success("S3から完了済み評価結果を復元しました。")
+            else:
+                detail_df, comparison_df = evaluate_ingestion_questions(
+                    evaluation_questions, subset, evaluation_search_type, evaluation_top_k,
+                    evaluation_model.strip(), evaluation_max_tokens,
+                    progress_callback=progress.progress, status_callback=status_area.info,
+                    checkpoint_callback=save_checkpoint,
+                    initial_detail=initial_detail, initial_comparison=initial_comparison
+                )
+                try:
+                    save_evaluation_checkpoint(
+                        ingestion_bucket, output_state, signature,
+                        detail_df, comparison_df, total_units, total_units,
+                        status="COMPLETE", experiment_info=experiment_info
+                    )
+                    checkpoint_area.success(
+                        f"完了結果をS3へ退避しました: {total_units} / {total_units}件"
+                    )
+                except Exception as exc:
+                    checkpoint_errors.append(str(exc))
+                    checkpoint_area.warning(f"完了結果のS3退避に失敗しました: {exc}")
             comparison_df = apply_effective_manual_review(comparison_df)
             status_area.success("Retrieve・回答生成・自動採点が完了しました。")
             st.session_state[output_state] = {
@@ -4494,15 +4656,10 @@ elif page == "🧪 データ取り込み検証":
                 ) if "difficulty" in evaluation_questions.columns else pd.DataFrame(),
                 "timestamp": datetime.now().strftime("%Y%m%d%H%M%S"),
                 "questions_snapshot": evaluation_questions.copy(),
-                "experiment_info": {
-                    "experiment_name": experiment_name,
-                    "experiment_memo": experiment_memo,
-                    "executed_at": datetime.now().isoformat(), "executed_by": executed_by,
-                    "source_pdf_name": source_pdf_name,
-                    "evaluation_csv_name": evaluation_csv_name,
-                    "requested_target_formats": experiment_target_formats
-                }
+                "experiment_info": experiment_info
             }
+            if checkpoint_errors:
+                st.warning("評価処理は継続しましたが、一部の途中保存に失敗しました。")
             if output_state == "ingestion_file_evaluation":
                 st.session_state.current_ingestion_evaluation_results = st.session_state[output_state]
                 st.session_state.pop("saved_evaluation_experiment_id", None)

@@ -214,6 +214,13 @@ PoC実行ロールの最小ポリシー例です。`<...>`は実リソースへ�
 
 `evaluation-history/`は評価履歴専用です。Knowledge Base Data Sourceのinclusion prefixには
 `documents/ingestion-test/kb-source/`だけを指定し、`evaluation-history/`を取り込み対象へ含めないでください。
+
+評価実行中は、質問×方式が1件完了するたびに
+`evaluation-history/_checkpoints/<評価グループ>.json`へ途中結果を上書き保存します。
+Streamlitの再起動や通信切断後も、同じ評価CSV・KB/Data Source ID・検索設定・モデル設定で
+再実行すると未完了の質問×方式だけを続行します。完了済みチェックポイントがある場合は、
+Bedrockを再実行せず結果を復元します。最初からやり直す場合だけ、画面の
+「保存済みの途中結果を使わず、新規評価として開始する」を選択してください。
 履歴削除機能は実装していないため、PoC実行ロールに`s3:DeleteObject`は不要です。
 
 Knowledge Baseサービスロールの最小ポリシー例です。OpenSearch Serverless利用時の例であり、
