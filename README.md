@@ -134,6 +134,37 @@ WORD_MARKDOWN:  documents/ingestion-test/kb-source/word-markdown/
 各比較グループのData Sourceはすべて `Hierarchical Chunking`、Parent 1500 tokens、Child 300 tokens、
 Overlap 60 tokensに手動設定してください。画面上の確認チェックを入れない限り比較は実行できません。
 
+#### Web再帰クロール比較
+
+「データ取り込み比較 PoC」→「Webページ取り込み」では、複数の起点URLから本文領域内のリンクを
+再帰的に巡回し、取得した同一ページ集合を `WEB_TXT` と `WEB_MARKDOWN` に変換します。
+
+- 1行に1件の起点URLを指定できます。
+- 同一ホスト内のHTMLだけを追跡し、外部ホスト、PDF、Office、画像、動画、圧縮ファイルを除外します。
+- ヘッダー、フッター、グローバルナビゲーション等のリンクは追跡対象にしません。
+- URLのfragmentとトラッキング用queryを除去し、URL由来の固定`page_id`で重複を防止します。
+- `robots.txt`遵守を既定で有効にし、アクセス間隔、最大深度、起点ごとの最大ページ数を設定できます。
+- 1ページ取得に失敗しても残りを継続し、取得・エラー・除外をそれぞれCSVへ出力します。
+- `web_crawl_manifest.json`を次回アップロードすると、新規・更新・変更なし・削除候補を判定できます。
+- 削除候補は自動削除しません。`deleted_candidates.csv`を確認して運用判断してください。
+- JASSO配下のmetadataは`source_authority=high`、その他は`medium`として保存します。
+
+各ページのKB同期用KeyはURL由来の固定値です。
+
+```text
+documents/ingestion-test/kb-source/web-txt/<page_id>.txt
+documents/ingestion-test/kb-source/web-markdown/<page_id>.md
+```
+
+再クロールで同じURLの本文が更新された場合は、同じKeyを更新します。管理用ログは次に保存します。
+
+```text
+documents/ingestion-test/datasource/<crawl_id>/crawl/
+```
+
+初回の再帰クロール評価前には、従来の単ページ取り込みで作成した`page.txt`、`page.md`と対応する
+metadataをWeb用prefixから除外し、新しい成果物を配置してから2つのWeb Data Sourceを同期してください。
+
 #### データ取り込み検証のIAM Action対応表
 
 | boto3 client | メソッド | IAM Action | Resource | 目的 |

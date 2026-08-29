@@ -22,6 +22,9 @@ from jasso_crawler import JassoCrawler
 from jasso_exporter import build_outputs
 from ingestion_excel import parse_xlsx_workbook
 from ingestion_word import parse_docx_document
+from web_crawler import (
+    WebCrawler, WebCrawlTarget, build_web_crawl_reports,
+)
 
 # ==========================================
 #  ダイアログ：フィードバック送信
@@ -877,6 +880,165 @@ def build_ingestion_s3_artifacts(datasource_id: str, source_type: str, formats: 
                  "content_type": "application/json"}
             ])
     return artifacts
+
+
+def build_web_crawl_artifacts(crawl_id: str, pages: list, ui_metadata: dict,
+                              selected_formats: tuple[str, ...], reports: dict) -> tuple[list[dict], dict]:
+    """クロールした各HTMLページをTXT/Markdownの安定Keyとsidecarへ変換する。"""
+    artifacts, metadata_by_page = [], {}
+    root = f"documents/ingestion-test/datasource/{crawl_id}/"
+
+    def add_pair(format_name, role, key, body, content_type, metadata):
+        metadata_body = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        artifacts.extend([
+            {"datasource_id": crawl_id, "format": format_name, "role": role,
+             "key": key, "body": body, "content_type": content_type},
+            {"datasource_id": crawl_id, "format": format_name, "role": role,
+             "key": f"{key}.metadata.json", "body": metadata_body,
+             "content_type": "application/json"}
+        ])
+
+    for page in pages:
+        source_host = urlparse(page.source_url).hostname or ""
+        authority = "high" if (
+            source_host == "jasso.go.jp" or source_host.endswith(".jasso.go.jp")
+        ) else "medium"
+        metadata_by_page[page.page_id] = {}
+        specs = []
+        if "WEB_TXT" in selected_formats:
+            specs.append(("WEB_TXT", "txt", page.text, "text/plain; charset=utf-8"))
+        if "WEB_MARKDOWN" in selected_formats:
+            specs.append(("WEB_MARKDOWN", "md", page.markdown, "text/markdown; charset=utf-8"))
+        for format_name, extension, content, content_type in specs:
+            file_name = f"{page.page_id}.{extension}"
+            metadata = build_ingestion_metadata(
+                "web", "txt" if format_name == "WEB_TXT" else "markdown",
+                {**ui_metadata, "priority": authority}, page.source_url, file_name,
+                page.title, crawl_id, page.source_url
+            )
+            metadata["metadataAttributes"].update({
+                "page_id": page.page_id, "crawl_id": crawl_id,
+                "crawl_root_url": page.root_url, "crawl_parent_url": page.parent_url,
+                "crawl_depth": page.depth, "content_hash": page.content_hash,
+                "crawled_at": page.crawled_at, "source_domain": source_host,
+                "source_authority": authority, "crawler_version": reports["manifest_data"].get("crawler_version", "")
+            })
+            remove_empty_metadata_attributes(metadata)
+            metadata_by_page[page.page_id][format_name] = metadata
+            body = content.encode("utf-8")
+            folder = "web-txt" if format_name == "WEB_TXT" else "web-markdown"
+            add_pair(format_name, "管理用正本",
+                     f"{root}processed/{folder}/{file_name}", body, content_type, metadata)
+            # page_idはURL由来の固定値なので、再クロール時も同じKeyへ更新できる。
+            add_pair(format_name, "KB同期用コピー",
+                     f"{INGESTION_TEST_KB_PREFIXES[format_name]}{file_name}",
+                     body, content_type, metadata)
+
+    log_specs = [
+        ("manifest.json", reports["manifest"], "application/json"),
+        ("crawl_report.csv", reports["report"], "text/csv; charset=utf-8"),
+        ("crawl_errors.csv", reports["errors"], "text/csv; charset=utf-8"),
+        ("crawl_skipped.csv", reports["skipped"], "text/csv; charset=utf-8"),
+        ("deleted_candidates.csv", reports["deleted"], "text/csv; charset=utf-8"),
+    ]
+    for file_name, body, content_type in log_specs:
+        artifacts.append({
+            "datasource_id": crawl_id, "format": "WEB_CRAWL_LOG", "role": "管理用ログ",
+            "key": f"{root}crawl/{file_name}", "body": body, "content_type": content_type
+        })
+    return artifacts, metadata_by_page
+
+
+def upload_web_crawl_artifacts_to_s3(artifacts: list[dict], bucket: str,
+                                     source_label: str = "Web crawl") -> list[dict]:
+    """Webの固定ページID成果物を更新可能としてS3へ保存する。削除候補は自動削除しない。"""
+    s3 = create_aws_client("s3")
+    rows = []
+    allowed_roots = (
+        "documents/ingestion-test/datasource/",
+        INGESTION_TEST_KB_PREFIXES["WEB_TXT"],
+        INGESTION_TEST_KB_PREFIXES["WEB_MARKDOWN"],
+    )
+    for artifact in artifacts:
+        started = time.perf_counter()
+        key = artifact["key"]
+        row = {
+            "datasource_id": artifact["datasource_id"], "元データ": source_label,
+            "形式": artifact["format"], "配置区分": artifact["role"],
+            "S3 Key": key, "アップロード結果": "失敗", "所要時間(ms)": 0,
+            "s3_upload_ms": 0, "エラー内容": ""
+        }
+        try:
+            if not key.startswith(allowed_roots) or ".." in key.split("/"):
+                raise ValueError("許可されたWeb検証prefix外のS3 Keyです。")
+            s3.put_object(
+                Bucket=bucket, Key=key, Body=artifact["body"],
+                ContentType=artifact["content_type"]
+            )
+            row["アップロード結果"] = "成功"
+        except Exception as exc:
+            row["エラー内容"] = str(exc)
+        row["所要時間(ms)"] = round((time.perf_counter() - started) * 1000, 1)
+        row["s3_upload_ms"] = row["所要時間(ms)"]
+        rows.append(row)
+    return rows
+
+
+def build_web_crawl_output(crawl_result, selected_formats: tuple[str, ...],
+                           ui_metadata: dict, previous_manifest: dict | None = None,
+                           diff_only: bool = False) -> dict:
+    """クロール結果から画面表示、ZIP、S3成果物、差分レポートをまとめて作る。"""
+    reports = build_web_crawl_reports(crawl_result, previous_manifest)
+    pages = [
+        page for page in crawl_result.pages
+        if not diff_only or reports["statuses"].get(page.page_id) in {"new", "updated"}
+    ]
+    crawl_id = generate_datasource_id()
+    artifacts, metadata_by_page = build_web_crawl_artifacts(
+        crawl_id, pages, ui_metadata, selected_formats, reports
+    )
+    results, previews = [], []
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+        for page in pages:
+            for format_name in selected_formats:
+                extension = "txt" if format_name == "WEB_TXT" else "md"
+                content = page.text if format_name == "WEB_TXT" else page.markdown
+                metadata = metadata_by_page[page.page_id][format_name]
+                archive_name = f"{'web_txt' if format_name == 'WEB_TXT' else 'web_markdown'}/{page.page_id}.{extension}"
+                output_zip.writestr(archive_name, content)
+                output_zip.writestr(
+                    f"{archive_name}.metadata.json",
+                    json.dumps(metadata, ensure_ascii=False, indent=2)
+                )
+                results.append({
+                    "datasource_id": crawl_id, "page_id": page.page_id,
+                    "元ファイル名 / URL": page.source_url, "起点URL": page.root_url,
+                    "深度": page.depth, "生成形式": format_name, "文字数": len(content),
+                    "HTTP取得・本文抽出時間(ms)": page.elapsed_ms,
+                    "変換時間(ms)": page.elapsed_ms, "結果": "成功", "エラー内容": ""
+                })
+                previews.append({
+                    "datasource_id": crawl_id, "page_id": page.page_id,
+                    "source": page.source_url, "root_url": page.root_url,
+                    "depth": page.depth, "format": format_name, "count": len(content),
+                    "metadata": metadata, "text": content[:5000]
+                })
+        for name, body in [
+            ("web_crawl_manifest.json", reports["manifest"]),
+            ("web_crawl_report.csv", reports["report"]),
+            ("web_crawl_errors.csv", reports["errors"]),
+            ("web_crawl_skipped.csv", reports["skipped"]),
+            ("deleted_candidates.csv", reports["deleted"]),
+        ]:
+            output_zip.writestr(name, body)
+    return {
+        "crawl_id": crawl_id, "crawl_result": crawl_result,
+        "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+        "artifacts": artifacts, "reports": reports,
+        "filename": datetime.now().strftime("web_crawl_ingestion_%Y%m%d%H%M%S.zip"),
+        "selected_formats": list(selected_formats), "diff_only": diff_only,
+    }
 
 
 def build_excel_ingestion_artifacts(xlsx_bytes: bytes, original_name: str, datasource_id: str,
@@ -3715,74 +3877,108 @@ elif page == "🧪 データ取り込み検証":
             )
 
     with web_tab:
-        st.subheader("Webページ取り込み")
-        web_url = st.text_input("URL（1件）", placeholder="https://example.com/page", key="ingestion_web_url")
+        st.subheader("Webページ取り込み（再帰クロール対応）")
+        web_mode = st.radio(
+            "取得範囲", ["下層ページをクロール", "入力したページだけ"],
+            horizontal=True, key="ingestion_web_mode"
+        )
+        default_web_roots = (
+            "https://www.jasso.go.jp/index.html\n"
+            "https://www.tus.ac.jp/tuslife/campuslife/scholarship/"
+        )
+        web_roots_text = st.text_area(
+            "起点URL（1行に1件）", value=default_web_roots, height=100,
+            help="本文領域にある同一ホスト内リンクだけを追跡します。外部サイトやPDF等は除外します。",
+            key="ingestion_web_roots"
+        )
+        crawl_col1, crawl_col2, crawl_col3 = st.columns(3)
+        web_max_depth = crawl_col1.number_input(
+            "最大深度", min_value=0, max_value=10, value=3, step=1,
+            disabled=web_mode == "入力したページだけ", key="ingestion_web_max_depth"
+        )
+        web_max_pages = crawl_col2.number_input(
+            "起点URLごとの最大ページ数", min_value=1, max_value=1000, value=300, step=10,
+            disabled=web_mode == "入力したページだけ", key="ingestion_web_max_pages"
+        )
+        web_interval = crawl_col3.number_input(
+            "アクセス間隔（秒）", min_value=0.5, max_value=10.0, value=1.0, step=0.5,
+            key="ingestion_web_interval"
+        )
+        respect_robots = st.checkbox(
+            "robots.txtを遵守する", value=True, key="ingestion_web_respect_robots"
+        )
+        previous_web_manifest_file = st.file_uploader(
+            "前回の web_crawl_manifest.json（任意）", type=["json"],
+            key="ingestion_web_previous_manifest"
+        )
+        web_output_mode = st.radio(
+            "出力モード", ["全件出力", "新規・更新分のみ"], horizontal=True,
+            key="ingestion_web_output_mode"
+        )
         web_format_col1, web_format_col2 = st.columns(2)
         include_web_txt = web_format_col1.checkbox("TXT", value=True, key="include_web_txt")
         include_web_markdown = web_format_col2.checkbox("Markdown", value=True, key="include_web_md")
 
-        if st.button("Webページ変換を実行", type="primary", key="run_web_ingestion"):
-            if not web_url.strip():
-                st.error("URLを入力してください。")
+        if st.button("Webクロール・変換を実行", type="primary", key="run_web_ingestion"):
+            web_root_urls = list(dict.fromkeys(
+                line.strip() for line in web_roots_text.splitlines() if line.strip()
+            ))
+            if not web_root_urls:
+                st.error("起点URLを1件以上入力してください。")
             elif not any([include_web_txt, include_web_markdown]):
                 st.error("生成形式を1つ以上選択してください。")
             else:
-                results, previews, artifacts = [], [], []
-                zip_buffer = io.BytesIO()
                 try:
-                    datasource_id = generate_datasource_id()
-                    web_text, web_markdown, web_title, web_metrics = fetch_and_extract_web_page(web_url.strip())
-                    fallback_name = urlparse(web_url).path.rstrip("/").split("/")[-1] or "index"
-                    safe_name = sanitize_document_name(web_title or fallback_name, fallback="web_page")
-                    formats, artifact_formats, metadata_by_format = [], {}, {}
-                    if include_web_txt:
-                        formats.append(("WEB_TXT", "txt", f"web_txt/{safe_name}.txt", web_text))
-                    if include_web_markdown:
-                        formats.append(("WEB_MARKDOWN", "markdown", f"web_markdown/{safe_name}.md", web_markdown))
-                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
-                        for config_name, format_name, archive_name, content in formats:
-                            generated_name = archive_name.rsplit("/", 1)[-1]
-                            kb_file_name = "page.txt" if config_name == "WEB_TXT" else "page.md"
-                            metadata = build_ingestion_metadata(
-                                "web", format_name, ingestion_ui_metadata, web_url.strip(),
-                                kb_file_name, web_title, datasource_id, safe_name
-                            )
-                            output_zip.writestr(archive_name, content)
-                            output_zip.writestr(
-                                f"{archive_name}.metadata.json",
-                                json.dumps(metadata, ensure_ascii=False, indent=2)
-                            )
-                            results.append({
-                                "datasource_id": datasource_id, "元ファイル名 / URL": web_url.strip(),
-                                "生成形式": config_name, "文字数": len(content),
-                                "HTTP取得時間(ms)": web_metrics["http_fetch_ms"],
-                                "本文抽出時間(ms)": web_metrics["body_extraction_ms"],
-                                "TXT生成時間(ms)": web_metrics["txt_generation_ms"],
-                                "Markdown生成時間(ms)": web_metrics["markdown_generation_ms"],
-                                "変換時間(ms)": web_metrics["total_conversion_ms"],
-                                "結果": "成功", "エラー内容": ""
-                            })
-                            previews.append({
-                                "datasource_id": datasource_id, "source": web_url.strip(),
-                                "format": config_name, "count": len(content),
-                                "metadata": metadata, "text": content[:5000]
-                            })
-                            artifact_formats[config_name] = content
-                            metadata_by_format[config_name] = metadata
-                    artifacts = build_ingestion_s3_artifacts(
-                        datasource_id, "web", artifact_formats, metadata_by_format
+                    previous_manifest = None
+                    if previous_web_manifest_file:
+                        previous_manifest = json.loads(previous_web_manifest_file.getvalue())
+                        if not isinstance(previous_manifest.get("items"), dict):
+                            raise ValueError("前回マニフェストにitemsがありません。")
+                    selected_formats = tuple(
+                        name for name, enabled in (
+                            ("WEB_TXT", include_web_txt),
+                            ("WEB_MARKDOWN", include_web_markdown)
+                        ) if enabled
+                    )
+                    effective_depth = 0 if web_mode == "入力したページだけ" else int(web_max_depth)
+                    effective_pages = 1 if web_mode == "入力したページだけ" else int(web_max_pages)
+                    targets = [
+                        WebCrawlTarget(url, max_depth=effective_depth, max_pages=effective_pages)
+                        for url in web_root_urls
+                    ]
+                    total_page_limit = max(1, len(targets) * effective_pages)
+                    progress_bar = st.progress(0)
+                    progress_status = st.empty()
+
+                    def update_web_crawl_progress(info):
+                        progress_bar.progress(min(info.get("count", 0) / total_page_limit, 0.99))
+                        progress_status.info(
+                            f"{info.get('phase', '処理中')} / 深度 {info.get('depth', 0)} / "
+                            f"取得 {info.get('count', 0)}件 / エラー {info.get('errors', 0)}件\n\n"
+                            f"{info.get('url', '')}"
+                        )
+
+                    crawler = WebCrawler(
+                        interval=float(web_interval), timeout=20,
+                        respect_robots=respect_robots
+                    )
+                    crawl_result = crawler.crawl(targets, progress=update_web_crawl_progress)
+                    if not crawl_result.pages:
+                        raise ValueError("取得できたHTMLページがありません。エラーログを確認してください。")
+                    web_output = build_web_crawl_output(
+                        crawl_result, selected_formats, ingestion_ui_metadata,
+                        previous_manifest=previous_manifest,
+                        diff_only=(web_output_mode == "新規・更新分のみ")
+                    )
+                    st.session_state.ingestion_web_output = web_output
+                    progress_bar.progress(1.0)
+                    progress_status.success(
+                        f"クロール完了: 取得 {len(crawl_result.pages)}件 / "
+                        f"エラー {len(crawl_result.errors)}件 / 除外 {len(crawl_result.skipped)}件"
                     )
                 except Exception as exc:
-                    results.append({
-                        "datasource_id": locals().get("datasource_id", ""),
-                        "元ファイル名 / URL": web_url.strip(), "生成形式": "WEB",
-                        "文字数": 0, "変換時間(ms)": 0, "結果": "失敗", "エラー内容": str(exc)
-                    })
-                st.session_state.ingestion_web_output = {
-                    "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
-                    "artifacts": artifacts,
-                    "filename": datetime.now().strftime("web_ingestion_test_%Y%m%d%H%M%S.zip")
-                }
+                    st.error(f"Webクロール・変換エラー: {exc}")
+                    st.code(traceback.format_exc())
                 for stale_key in [
                     "ingestion_web_upload_results", "ingestion_web_sync_results",
                     "ingestion_web_synced_config", "ingestion_web_evaluation"
@@ -3792,10 +3988,28 @@ elif page == "🧪 データ取り込み検証":
         if "ingestion_web_output" in st.session_state:
             web_output = st.session_state.ingestion_web_output
             st.subheader("Web処理結果")
-            st.dataframe(pd.DataFrame(web_output["results"]), use_container_width=True)
-            st.dataframe(build_conversion_summary(web_output["results"]), use_container_width=True)
-            for preview in web_output["previews"]:
-                with st.expander(f"✅ {preview['datasource_id']} / {preview['source']} / {preview['format']} / {preview['count']}文字"):
+            crawl_result = web_output.get("crawl_result")
+            if crawl_result:
+                reports = web_output["reports"]
+                status_counts = Counter(reports["statuses"].values())
+                st.success(
+                    f"取得 {len(crawl_result.pages)}ページ / 新規 {status_counts.get('new', 0)} / "
+                    f"更新 {status_counts.get('updated', 0)} / 変更なし {status_counts.get('unchanged', 0)} / "
+                    f"エラー {len(crawl_result.errors)} / 除外 {len(crawl_result.skipped)} / "
+                    f"削除候補 {len(reports['removed'])}"
+                )
+            if web_output["results"]:
+                st.dataframe(pd.DataFrame(web_output["results"]), use_container_width=True)
+                st.dataframe(build_conversion_summary(web_output["results"]), use_container_width=True)
+            else:
+                st.info("新規・更新対象のページはありません。レポートのみダウンロードできます。")
+            preview_limit = min(len(web_output["previews"]), 20)
+            st.caption(f"プレビューは先頭{preview_limit}件を表示します。全件はZIPで確認できます。")
+            for preview in web_output["previews"][:preview_limit]:
+                with st.expander(
+                    f"✅ depth {preview['depth']} / {preview['source']} / "
+                    f"{preview['format']} / {preview['count']}文字"
+                ):
                     st.json(preview["metadata"])
                     if preview["format"] == "WEB_MARKDOWN":
                         st.markdown(preview["text"])
@@ -3805,6 +4019,28 @@ elif page == "🧪 データ取り込み検証":
                 st.download_button(
                     "Web変換ZIPをダウンロード", web_output["zip"], web_output["filename"],
                     "application/zip", key="download_web_ingestion"
+                )
+            if web_output.get("reports"):
+                report_cols = st.columns(5)
+                report_cols[0].download_button(
+                    "マニフェスト", web_output["reports"]["manifest"],
+                    "web_crawl_manifest.json", "application/json"
+                )
+                report_cols[1].download_button(
+                    "取得レポート", web_output["reports"]["report"],
+                    "web_crawl_report.csv", "text/csv"
+                )
+                report_cols[2].download_button(
+                    "エラーログ", web_output["reports"]["errors"],
+                    "web_crawl_errors.csv", "text/csv"
+                )
+                report_cols[3].download_button(
+                    "除外ログ", web_output["reports"]["skipped"],
+                    "web_crawl_skipped.csv", "text/csv"
+                )
+                report_cols[4].download_button(
+                    "削除候補", web_output["reports"]["deleted"],
+                    "deleted_candidates.csv", "text/csv"
                 )
 
     with excel_tab:
@@ -4153,9 +4389,9 @@ elif page == "🧪 データ取り込み検証":
             st.error("Web TXT/Markdownがすべて成功した変換結果を先に作成してください。")
         else:
             try:
-                st.session_state.ingestion_web_upload_results = upload_ingestion_artifacts_to_s3(
+                st.session_state.ingestion_web_upload_results = upload_web_crawl_artifacts_to_s3(
                     output["artifacts"], ingestion_bucket.strip(),
-                    output["results"][0].get("元ファイル名 / URL", "")
+                    " / ".join(sorted({row.get("起点URL", "") for row in output["results"] if row.get("起点URL")}))
                 )
             except Exception as exc:
                 st.error(f"Web S3アップロードエラー: {exc}")
