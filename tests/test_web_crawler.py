@@ -108,6 +108,70 @@ def test_crawler_follows_same_host_main_links_with_depth_and_extension_guards():
     assert "https://example.com/noise" not in session.calls
 
 
+def test_crawler_stays_under_root_path_scope():
+    pages = {
+        "https://example.com/guide/": _html(
+            "root", "<p>起点ページの十分な本文です。</p>"
+            "<a href='/guide/detail/'>inside</a><a href='/news/'>outside</a>"
+        ),
+        "https://example.com/guide/detail/": _html(
+            "inside", "<p>対象範囲内にある、抽出条件を満たす十分な長さの本文です。</p>"
+        ),
+        "https://example.com/news/": _html(
+            "outside", "<p>対象範囲外にある十分な長さの本文です。</p>"
+        ),
+    }
+    session = FakeSession(pages)
+    crawler = WebCrawler(interval=0.5, respect_robots=False, session=session)
+    crawler.interval = 0
+    result = crawler.crawl([WebCrawlTarget("https://example.com/guide/", 2, 10)])
+
+    assert [page.source_url for page in result.pages] == [
+        "https://example.com/guide/", "https://example.com/guide/detail/"
+    ]
+    assert "https://example.com/news/" not in session.calls
+    assert any(row.reason == "outside_path_scope" for row in result.skipped)
+
+
+def test_crawler_records_when_max_pages_is_reached():
+    pages = {
+        "https://example.com/guide/": _html(
+            "root", "<p>起点ページに掲載されている十分な長さの本文です。</p><a href='/guide/a/'>a</a>"
+        ),
+        "https://example.com/guide/a/": _html(
+            "a", "<p>次ページにある十分な長さの本文です。</p>"
+        ),
+    }
+    crawler = WebCrawler(
+        interval=0.5, respect_robots=False, session=FakeSession(pages)
+    )
+    crawler.interval = 0
+    result = crawler.crawl([WebCrawlTarget("https://example.com/guide/", 2, 1)])
+
+    assert len(result.pages) == 1
+    assert any(
+        row.event == "limit_reached" and row.reason == "max_pages_reached:1"
+        for row in result.skipped
+    )
+
+
+def test_crawler_does_not_report_limit_for_only_out_of_scope_links():
+    pages = {
+        "https://example.com/guide/": _html(
+            "root", "<p>起点ページに掲載されている十分な長さの本文です。</p>"
+            "<a href='/news/'>outside</a>"
+        ),
+    }
+    crawler = WebCrawler(
+        interval=0.5, respect_robots=False, session=FakeSession(pages)
+    )
+    crawler.interval = 0
+    result = crawler.crawl([WebCrawlTarget("https://example.com/guide/", 2, 1)])
+
+    assert len(result.pages) == 1
+    assert not any(row.event == "limit_reached" for row in result.skipped)
+
+
 def test_manifest_detects_new_updated_unchanged_and_removed():
     pages = {
         "https://example.com/index.html": _html("root", "<p>起点ページに掲載されている十分な長さの本文です。</p><a href='/child'>child</a>"),

@@ -3883,12 +3883,15 @@ elif page == "🧪 データ取り込み検証":
             horizontal=True, key="ingestion_web_mode"
         )
         default_web_roots = (
-            "https://www.jasso.go.jp/index.html\n"
+            "https://www.jasso.go.jp/shogakukin/\n"
             "https://www.tus.ac.jp/tuslife/campuslife/scholarship/"
         )
         web_roots_text = st.text_area(
             "起点URL（1行に1件）", value=default_web_roots, height=100,
-            help="本文領域にある同一ホスト内リンクだけを追跡します。外部サイトやPDF等は除外します。",
+            help=(
+                "各起点URLのパス配下にある本文リンクだけを追跡します。"
+                "外部サイト、同一サイトの別領域、PDF等は除外します。"
+            ),
             key="ingestion_web_roots"
         )
         crawl_col1, crawl_col2, crawl_col3 = st.columns(3)
@@ -3897,7 +3900,7 @@ elif page == "🧪 データ取り込み検証":
             disabled=web_mode == "入力したページだけ", key="ingestion_web_max_depth"
         )
         web_max_pages = crawl_col2.number_input(
-            "起点URLごとの最大ページ数", min_value=1, max_value=1000, value=300, step=10,
+            "起点URLごとの最大ページ数", min_value=1, max_value=1000, value=500, step=10,
             disabled=web_mode == "入力したページだけ", key="ingestion_web_max_pages"
         )
         web_interval = crawl_col3.number_input(
@@ -3976,6 +3979,19 @@ elif page == "🧪 データ取り込み検証":
                         f"クロール完了: 取得 {len(crawl_result.pages)}件 / "
                         f"エラー {len(crawl_result.errors)}件 / 除外 {len(crawl_result.skipped)}件"
                     )
+                    limit_logs = [
+                        row for row in crawl_result.skipped
+                        if row.reason.startswith("max_pages_reached:")
+                    ]
+                    if limit_logs:
+                        roots = " / ".join(
+                            f"{row.root_url}（{row.reason.split(':', 1)[1]}ページ）"
+                            for row in limit_logs
+                        )
+                        st.warning(
+                            "最大ページ数に達したため、未取得ページが残っている可能性があります。"
+                            f"上限を増やして再実行してください: {roots}"
+                        )
                 except Exception as exc:
                     st.error(f"Webクロール・変換エラー: {exc}")
                     st.code(traceback.format_exc())
@@ -3998,6 +4014,15 @@ elif page == "🧪 データ取り込み検証":
                     f"エラー {len(crawl_result.errors)} / 除外 {len(crawl_result.skipped)} / "
                     f"削除候補 {len(reports['removed'])}"
                 )
+                limit_logs = [
+                    row for row in crawl_result.skipped
+                    if row.reason.startswith("max_pages_reached:")
+                ]
+                if limit_logs:
+                    st.warning(
+                        "最大ページ数に到達した起点があります。現在の結果は全件取得ではありません: "
+                        + " / ".join(row.root_url for row in limit_logs)
+                    )
             if web_output["results"]:
                 st.dataframe(pd.DataFrame(web_output["results"]), use_container_width=True)
                 st.dataframe(build_conversion_summary(web_output["results"]), use_container_width=True)

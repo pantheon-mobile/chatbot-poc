@@ -17,7 +17,7 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-WEB_CRAWLER_VERSION = "web-crawler-v1"
+WEB_CRAWLER_VERSION = "web-crawler-v2"
 USER_AGENT = "ScholarshipWebCrawler/1.0 (authorized institutional use)"
 SKIP_SCHEMES = ("javascript:", "mailto:", "tel:", "data:")
 SKIP_EXTENSIONS = re.compile(
@@ -42,6 +42,7 @@ class WebCrawlTarget:
     root_url: str
     max_depth: int = 3
     max_pages: int = 100
+    allowed_path_prefix: str = ""
 
 
 @dataclass
@@ -196,6 +197,29 @@ def _same_host(url: str, root_url: str) -> bool:
     return urlsplit(url).hostname == urlsplit(root_url).hostname
 
 
+def resolve_allowed_path_prefix(root_url: str, configured_prefix: str = "") -> str:
+    """起点URLから、同一ホスト内で追跡してよいパス範囲を決定する。"""
+    configured = (configured_prefix or "").strip()
+    if configured:
+        path = urlsplit(normalize_web_url(configured, root_url)).path
+    else:
+        path = urlsplit(root_url).path or "/"
+        if not path.endswith("/"):
+            last_segment = path.rsplit("/", 1)[-1]
+            if "." in last_segment:
+                path = path.rsplit("/", 1)[0] + "/"
+    path = re.sub(r"/{2,}", "/", path or "/")
+    return path if path == "/" or path.endswith("/") else path + "/"
+
+
+def _within_path_scope(url: str, allowed_path_prefix: str) -> bool:
+    path = urlsplit(url).path or "/"
+    if allowed_path_prefix == "/":
+        return True
+    scope_root = allowed_path_prefix.rstrip("/")
+    return path == scope_root or path.startswith(allowed_path_prefix)
+
+
 class WebCrawler:
     def __init__(self, interval: float = 1.0, timeout: float = 20.0,
                  respect_robots: bool = True, session: requests.Session | None = None):
@@ -254,6 +278,9 @@ class WebCrawler:
             if not root_url:
                 result.errors.append(WebCrawlLog("invalid_root", raw_target.root_url, "", 0, "無効な起点URL"))
                 continue
+            allowed_path_prefix = resolve_allowed_path_prefix(
+                root_url, raw_target.allowed_path_prefix
+            )
             pending = deque([(root_url, "", 0)])
             seen_candidates: set[str] = set()
             root_count = 0
@@ -264,6 +291,11 @@ class WebCrawler:
                 seen_candidates.add(url)
                 if not _same_host(url, root_url):
                     result.skipped.append(WebCrawlLog("skipped", url, root_url, depth, "different_host", parent_url))
+                    continue
+                if not _within_path_scope(url, allowed_path_prefix):
+                    result.skipped.append(WebCrawlLog(
+                        "skipped", url, root_url, depth, "outside_path_scope", parent_url
+                    ))
                     continue
                 if SKIP_EXTENSIONS.search(urlsplit(url).path):
                     result.skipped.append(WebCrawlLog("skipped", url, root_url, depth, "unsupported_extension", parent_url))
@@ -306,6 +338,19 @@ class WebCrawler:
                     if progress:
                         progress({"phase": "Webページ取得エラー", "root_url": root_url, "url": url,
                                   "depth": depth, "count": len(result.pages), "errors": len(result.errors)})
+            remaining_in_scope = any(
+                candidate_url not in globally_visited
+                and _same_host(candidate_url, root_url)
+                and _within_path_scope(candidate_url, allowed_path_prefix)
+                and not SKIP_EXTENSIONS.search(urlsplit(candidate_url).path)
+                and candidate_depth <= raw_target.max_depth
+                for candidate_url, _, candidate_depth in pending
+            )
+            if remaining_in_scope and root_count >= raw_target.max_pages:
+                result.skipped.append(WebCrawlLog(
+                    "limit_reached", root_url, root_url, 0,
+                    f"max_pages_reached:{raw_target.max_pages}", ""
+                ))
         result.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
         return result
 
