@@ -27,6 +27,14 @@ def _markdown_table(rows: list[list[str]]) -> str:
     ])
 
 
+def _safe_shape_type(shape):
+    """Return a shape type without aborting on unsupported PowerPoint shapes."""
+    try:
+        return shape.shape_type
+    except (NotImplementedError, ValueError):
+        return None
+
+
 def parse_pptx_presentation(pptx_bytes: bytes, original_name: str = "") -> dict:
     """PPTXをスライド順の構造付きTXTとMarkdownへ変換する。"""
     started = time.perf_counter()
@@ -47,7 +55,10 @@ def parse_pptx_presentation(pptx_bytes: bytes, original_name: str = "") -> dict:
         preview = {"slide_number": slide_number, "title": title, "texts": [], "tables": [], "notes": ""}
 
         for shape in slide.shapes:
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            # python-pptx can expose some valid Office shapes but raise
+            # NotImplementedError when their shape_type is read.  Such a shape
+            # must not make the whole presentation conversion fail.
+            if _safe_shape_type(shape) == MSO_SHAPE_TYPE.PICTURE:
                 image_count += 1
             if getattr(shape, "has_table", False):
                 rows = _table_rows(shape.table)

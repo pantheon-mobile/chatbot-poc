@@ -6,7 +6,7 @@ from pathlib import Path
 from pptx import Presentation
 from pptx.util import Inches
 
-from ingestion_powerpoint import parse_pptx_presentation
+from ingestion_powerpoint import _safe_shape_type, parse_pptx_presentation
 
 
 def _sample_pptx() -> bytes:
@@ -66,6 +66,15 @@ def test_parse_pptx_preserves_slide_markers_text_and_table():
     assert "第一種は無利子" in result["markdown_text"]
     assert "| 種類 | 利子 |" in result["markdown_text"]
     assert "| 第二種 | 有利子 |" in result["markdown_text"]
+
+
+def test_unrecognized_powerpoint_shape_type_is_ignored():
+    class UnsupportedShape:
+        @property
+        def shape_type(self):
+            raise NotImplementedError("Shape instance of unrecognized shape type")
+
+    assert _safe_shape_type(UnsupportedShape()) is None
 
 
 def test_build_ppt_artifacts_has_three_kb_formats_and_sidecars():
