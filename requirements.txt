@@ -3,6 +3,7 @@ pandas
 boto3
 openpyxl
 python-docx
+python-pptx
 pypdf
 requests
 beautifulsoup4

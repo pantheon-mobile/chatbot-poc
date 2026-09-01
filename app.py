@@ -22,6 +22,7 @@ from jasso_crawler import JassoCrawler
 from jasso_exporter import build_outputs
 from ingestion_excel import parse_xlsx_workbook
 from ingestion_word import parse_docx_document
+from ingestion_powerpoint import parse_pptx_presentation
 from web_crawler import (
     WebCrawler, WebCrawlTarget, build_web_crawl_reports,
 )
@@ -257,15 +258,19 @@ INGESTION_TEST_KB_PREFIXES = {
     "WORD_DOCX": "documents/ingestion-test/kb-source/word-docx/",
     "WORD_TXT": "documents/ingestion-test/kb-source/word-txt/",
     "WORD_MARKDOWN": "documents/ingestion-test/kb-source/word-markdown/",
+    "PPT_PPTX": "documents/ingestion-test/kb-source/ppt-pptx/",
+    "PPT_TXT": "documents/ingestion-test/kb-source/ppt-txt/",
+    "PPT_MARKDOWN": "documents/ingestion-test/kb-source/ppt-markdown/",
 }
 INGESTION_FILE_FORMATS = ("FILE_PDF", "FILE_TXT", "FILE_MARKDOWN", "FILE_VISION_MARKDOWN")
 PDF_COMPARISON_BUCKET = "chat-bot-poc-plus"
 INGESTION_WEB_FORMATS = ("WEB_TXT", "WEB_MARKDOWN")
 INGESTION_EXCEL_FORMATS = ("EXCEL_XLSX", "EXCEL_CSV", "EXCEL_MARKDOWN")
 INGESTION_WORD_FORMATS = ("WORD_DOCX", "WORD_TXT", "WORD_MARKDOWN")
+INGESTION_PPT_FORMATS = ("PPT_PPTX", "PPT_TXT", "PPT_MARKDOWN")
 INGESTION_ALL_FORMATS = (
     *INGESTION_FILE_FORMATS, *INGESTION_WEB_FORMATS,
-    *INGESTION_EXCEL_FORMATS, *INGESTION_WORD_FORMATS
+    *INGESTION_EXCEL_FORMATS, *INGESTION_WORD_FORMATS, *INGESTION_PPT_FORMATS
 )
 INGESTION_SYNC_SUCCESS_STATUSES = {"COMPLETE"}
 INGESTION_SYNC_FAILURE_STATUSES = {"FAILED", "STOPPED"}
@@ -285,6 +290,11 @@ INGESTION_WORD_REVIEW_COLUMNS = [
     "numbered_list_preservation", "table_structure_preservation", "merged_cell_context_preservation",
     "hyperlink_preservation", "header_footer_separation", "page_break_preservation",
     "footnote_preservation", "comment_preservation"
+]
+INGESTION_PPT_REVIEW_COLUMNS = [
+    "slide_order_preservation", "slide_title_preservation", "text_box_order_preservation",
+    "bullet_level_preservation", "table_structure_preservation", "image_context_preservation",
+    "speaker_notes_preservation", "cross_slide_retrieval"
 ]
 EVALUATION_HISTORY_PREFIX = "evaluation-history/"
 EVALUATION_HISTORY_SCHEMA_VERSION = "1.0"
@@ -1163,6 +1173,59 @@ def build_word_ingestion_artifacts(docx_bytes: bytes, original_name: str, dataso
     return artifacts, metadata_by_format
 
 
+def build_ppt_ingestion_artifacts(pptx_bytes: bytes, original_name: str, datasource_id: str,
+                                  ppt_result: dict, ui_metadata: dict) -> tuple[list[dict], dict]:
+    """PowerPoint原本・構造付きTXT・Markdownの管理用正本とKB同期用コピーを生成する。"""
+    root = f"documents/ingestion-test/datasource/{datasource_id}/"
+    common = {
+        "source_file_type": "powerpoint", "original_extension": ".pptx",
+        "slide_count": ppt_result["slide_count"], "table_count": ppt_result["table_count"],
+        "image_count": ppt_result["image_count"],
+        "text_shape_count": ppt_result["text_shape_count"],
+        "notes_count": ppt_result["notes_count"]
+    }
+    specs = [
+        ("PPT_PPTX", "pptx_original", "original", "source.pptx", pptx_bytes,
+         "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        ("PPT_TXT", "txt", "pptx_to_txt", "source.txt",
+         ppt_result["txt_text"].encode("utf-8"), "text/plain; charset=utf-8"),
+        ("PPT_MARKDOWN", "markdown", "pptx_to_markdown", "source.md",
+         ppt_result["markdown_text"].encode("utf-8"), "text/markdown; charset=utf-8")
+    ]
+    metadata_by_format, artifacts = {}, []
+
+    def add_pair(format_name, role, key, body, content_type, metadata):
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        artifacts.extend([
+            {"datasource_id": datasource_id, "format": format_name, "role": role,
+             "key": key, "body": body, "content_type": content_type},
+            {"datasource_id": datasource_id, "format": format_name, "role": role,
+             "key": f"{key}.metadata.json", "body": metadata_bytes,
+             "content_type": "application/json"}
+        ])
+
+    for format_name, ingestion_format, method, file_name, body, content_type in specs:
+        metadata = build_ingestion_metadata(
+            "powerpoint", ingestion_format, ui_metadata, "", file_name, ppt_result["title"],
+            datasource_id, original_name
+        )
+        metadata["metadataAttributes"].update({**common, "conversion_method": method})
+        remove_empty_metadata_attributes(metadata)
+        metadata_by_format[format_name] = metadata
+        folder = {
+            "PPT_PPTX": "ppt-pptx", "PPT_TXT": "ppt-txt", "PPT_MARKDOWN": "ppt-markdown"
+        }[format_name]
+        add_pair(format_name, "管理用正本", f"{root}processed/{folder}/{file_name}",
+                 body, content_type, metadata)
+        add_pair(format_name, "KB同期用コピー",
+                 f"{INGESTION_TEST_KB_PREFIXES[format_name]}{datasource_id}/{file_name}",
+                 body, content_type, metadata)
+    add_pair("ORIGINAL", "管理用正本", f"{root}original/source.pptx", pptx_bytes,
+             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+             metadata_by_format["PPT_PPTX"])
+    return artifacts, metadata_by_format
+
+
 def upload_ingestion_artifacts_to_s3(artifacts: list[dict], bucket: str,
                                      source_label: str = "") -> list[dict]:
     """許可済み検証prefixの成果物を既存オブジェクトへ上書きせずアップロードする。"""
@@ -1625,7 +1688,8 @@ def evaluate_ingestion_questions(questions: pd.DataFrame, config: dict, search_t
                 **{column: "" for column in [
                     *INGESTION_MANUAL_REVIEW_COLUMNS,
                     *(INGESTION_EXCEL_REVIEW_COLUMNS if format_name.startswith("EXCEL_") else []),
-                    *(INGESTION_WORD_REVIEW_COLUMNS if format_name.startswith("WORD_") else [])
+                    *(INGESTION_WORD_REVIEW_COLUMNS if format_name.startswith("WORD_") else []),
+                    *(INGESTION_PPT_REVIEW_COLUMNS if format_name.startswith("PPT_") else [])
                 ]}
             })
             completed += 1
@@ -3543,8 +3607,9 @@ elif page == "🧪 データ取り込み検証":
         "priority": ingestion_priority
     }
 
-    pdf_tab, web_tab, excel_tab, word_tab = st.tabs([
-        "PDF取り込み比較", "Webページ取り込み", "Excel取り込み比較", "Word取り込み比較"
+    pdf_tab, web_tab, excel_tab, word_tab, ppt_tab = st.tabs([
+        "PDF取り込み比較", "Webページ取り込み", "Excel取り込み比較", "Word取り込み比較",
+        "PowerPoint取り込み比較"
     ])
 
     with pdf_tab:
@@ -4287,8 +4352,104 @@ elif page == "🧪 データ取り込み検証":
                 "application/zip", key="download_word_ingestion"
             )
 
+    with ppt_tab:
+        st.subheader("PowerPoint取り込み比較（.pptx）")
+        ppt_uploads = st.file_uploader(
+            "PPTXファイル（複数選択可）", type=["pptx"], accept_multiple_files=True,
+            key="ingestion_ppt_uploads"
+        )
+        st.caption("スライド順を維持してPPTX原本、構造付きTXT、Markdownを生成します。旧.pptは対象外です。")
+        if st.button("PowerPoint変換を実行", type="primary", key="run_ppt_ingestion"):
+            if not ppt_uploads:
+                st.error("PPTXファイルを1件以上アップロードしてください。")
+            else:
+                results, previews, artifacts = [], [], []
+                zip_buffer = io.BytesIO()
+                progress = st.progress(0)
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as output_zip:
+                    for ppt_index, uploaded_ppt in enumerate(ppt_uploads, start=1):
+                        datasource_id = generate_datasource_id()
+                        pptx_bytes = uploaded_ppt.getvalue()
+                        started = time.perf_counter()
+                        try:
+                            ppt_result = parse_pptx_presentation(pptx_bytes, uploaded_ppt.name)
+                            ppt_artifacts, metadata = build_ppt_ingestion_artifacts(
+                                pptx_bytes, uploaded_ppt.name, datasource_id,
+                                ppt_result, ingestion_ui_metadata
+                            )
+                            artifacts.extend(ppt_artifacts)
+                            for folder, file_name, content, format_name in [
+                                ("pptx", "source.pptx", pptx_bytes, "PPT_PPTX"),
+                                ("txt", "source.txt", ppt_result["txt_text"], "PPT_TXT"),
+                                ("markdown", "source.md", ppt_result["markdown_text"], "PPT_MARKDOWN")
+                            ]:
+                                archive_path = f"{datasource_id}/{folder}/{file_name}"
+                                output_zip.writestr(archive_path, content)
+                                output_zip.writestr(
+                                    f"{archive_path}.metadata.json",
+                                    json.dumps(metadata[format_name], ensure_ascii=False, indent=2)
+                                )
+                            results.append({
+                                "元ファイル名": uploaded_ppt.name, "datasource_id": datasource_id,
+                                "タイトル": ppt_result["title"], "スライド数": ppt_result["slide_count"],
+                                "表数": ppt_result["table_count"], "画像数": ppt_result["image_count"],
+                                "テキスト要素数": ppt_result["text_shape_count"],
+                                "ノート数": ppt_result["notes_count"],
+                                "pptx_load_ms": ppt_result["pptx_load_ms"],
+                                "slide_parse_ms": ppt_result["slide_parse_ms"],
+                                "txt_generation_ms": ppt_result["txt_generation_ms"],
+                                "markdown_generation_ms": ppt_result["markdown_generation_ms"],
+                                "generated_file_count": ppt_result["generated_file_count"],
+                                "generated_total_bytes": ppt_result["generated_total_bytes"],
+                                "変換時間(ms)": round((time.perf_counter() - started) * 1000, 1),
+                                "結果": "成功", "エラー内容": ""
+                            })
+                            previews.append({
+                                "datasource_id": datasource_id, "name": uploaded_ppt.name,
+                                "result": ppt_result, "metadata": metadata
+                            })
+                        except Exception as exc:
+                            results.append({
+                                "元ファイル名": uploaded_ppt.name, "datasource_id": datasource_id,
+                                "タイトル": "", "スライド数": 0, "表数": 0, "画像数": 0,
+                                "テキスト要素数": 0, "ノート数": 0, "pptx_load_ms": 0,
+                                "slide_parse_ms": 0, "txt_generation_ms": 0,
+                                "markdown_generation_ms": 0, "generated_file_count": 0,
+                                "generated_total_bytes": 0,
+                                "変換時間(ms)": round((time.perf_counter() - started) * 1000, 1),
+                                "結果": "失敗", "エラー内容": str(exc)
+                            })
+                        progress.progress(ppt_index / len(ppt_uploads))
+                failures = sum(row["結果"] != "成功" for row in results)
+                for row in results:
+                    row["conversion_failure_rate"] = failures / len(results) if results else 0
+                st.session_state.ingestion_ppt_output = {
+                    "zip": zip_buffer.getvalue(), "results": results, "previews": previews,
+                    "artifacts": artifacts,
+                    "filename": datetime.now().strftime("ppt_ingestion_test_%Y%m%d%H%M%S.zip")
+                }
+                for key in ["ingestion_ppt_upload_results", "ingestion_ppt_sync_results",
+                            "ingestion_ppt_synced_config", "ingestion_ppt_evaluation"]:
+                    st.session_state.pop(key, None)
+
+        if st.session_state.get("ingestion_ppt_output"):
+            ppt_output = st.session_state.ingestion_ppt_output
+            st.dataframe(pd.DataFrame(ppt_output["results"]), use_container_width=True)
+            for preview in ppt_output["previews"]:
+                result = preview["result"]
+                with st.expander(f"PPTX原本情報 / {preview['name']} / {preview['datasource_id']}"):
+                    st.json(preview["metadata"]["PPT_PPTX"])
+                with st.expander(f"TXTプレビュー / {preview['name']}"):
+                    st.text(result["txt_text"][:20000])
+                with st.expander(f"Markdownプレビュー / {preview['name']}"):
+                    st.markdown(result["markdown_text"][:20000])
+            st.download_button(
+                "PowerPoint比較ZIPをダウンロード", ppt_output["zip"], ppt_output["filename"],
+                "application/zip", key="download_ppt_ingestion"
+            )
+
     st.divider()
-    st.header("PDF 4方式 / Web 2方式 / Excel 3方式 / Word 3方式 RAG比較")
+    st.header("PDF 4方式 / Web 2方式 / Excel 3方式 / Word 3方式 / PowerPoint 3方式 RAG比較")
     st.warning(
         "ここでは検証専用KBだけを指定してください。KB/Data Sourceの作成・削除や、"
         "S3既存オブジェクトの上書きは行いません。"
@@ -4353,6 +4514,24 @@ elif page == "🧪 データ取り込み検証":
                 "knowledge_base_id": kb_id.strip(), "data_source_id": data_source_id.strip()
             }
 
+    st.markdown("**PowerPoint専用3KB**")
+    ppt_config_columns = st.columns(3)
+    for column, format_name in zip(ppt_config_columns, INGESTION_PPT_FORMATS):
+        secret_prefix = format_name.lower()
+        with column:
+            st.markdown(f"**{format_name}**")
+            kb_id = st.text_input(
+                "Knowledge Base ID", value=_setting("ingestion_test", f"{secret_prefix}_knowledge_base_id"),
+                key=f"ingestion_{secret_prefix}_kb_id"
+            )
+            data_source_id = st.text_input(
+                "Data Source ID", value=_setting("ingestion_test", f"{secret_prefix}_data_source_id"),
+                key=f"ingestion_{secret_prefix}_data_source_id"
+            )
+            ingestion_test_config[format_name] = {
+                "knowledge_base_id": kb_id.strip(), "data_source_id": data_source_id.strip()
+            }
+
     st.caption("各Data Sourceのinclusion prefix（固定）")
     st.code("\n".join(f"{name}: {prefix}" for name, prefix in INGESTION_TEST_KB_PREFIXES.items()))
 
@@ -4374,7 +4553,7 @@ elif page == "🧪 データ取り込み検証":
         default=available_pdf_upload_formats,
         key="ingestion_selected_pdf_upload_formats"
     )
-    upload_col1, upload_col2, upload_col3, upload_col4 = st.columns(4)
+    upload_col1, upload_col2, upload_col3, upload_col4, upload_col5 = st.columns(5)
     if upload_col1.button("選択したファイル成果物をS3へアップロード", key="upload_file_ingestion_to_s3"):
         if not available_pdf_upload_formats:
             st.error("S3へアップロード可能な成功成果物がありません。")
@@ -4463,11 +4642,33 @@ elif page == "🧪 データ取り込み検証":
                 st.error(f"Word S3アップロードエラー: {exc}")
                 st.code(traceback.format_exc())
 
+    if upload_col5.button("PowerPoint成果物をS3へアップロード", key="upload_ppt_ingestion_to_s3"):
+        for key in ["ingestion_ppt_upload_results", "ingestion_ppt_sync_results",
+                    "ingestion_ppt_synced_config", "ingestion_ppt_evaluation"]:
+            st.session_state.pop(key, None)
+        subset = {key: ingestion_test_config[key] for key in INGESTION_PPT_FORMATS}
+        config_errors = validate_ingestion_test_config(ingestion_bucket, subset)
+        output = st.session_state.get("ingestion_ppt_output")
+        if config_errors:
+            for message in config_errors:
+                st.error(message)
+        elif not output or not output.get("artifacts") or any(row["結果"] != "成功" for row in output["results"]):
+            st.error("PPTX/TXT/Markdownがすべて成功したPowerPoint変換結果を先に作成してください。")
+        else:
+            try:
+                st.session_state.ingestion_ppt_upload_results = upload_ingestion_artifacts_to_s3(
+                    output["artifacts"], ingestion_bucket.strip(), "PowerPoint"
+                )
+            except Exception as exc:
+                st.error(f"PowerPoint S3アップロードエラー: {exc}")
+                st.code(traceback.format_exc())
+
     for state_key, label in [
         ("ingestion_file_upload_results", "ファイルS3アップロード結果"),
         ("ingestion_web_upload_results", "Web S3アップロード結果"),
         ("ingestion_excel_upload_results", "Excel S3アップロード結果"),
-        ("ingestion_word_upload_results", "Word S3アップロード結果")
+        ("ingestion_word_upload_results", "Word S3アップロード結果"),
+        ("ingestion_ppt_upload_results", "PowerPoint S3アップロード結果")
     ]:
         if st.session_state.get(state_key):
             st.markdown(f"**{label}**")
@@ -4534,7 +4735,7 @@ elif page == "🧪 データ取り込み検証":
         "同期するPDF比較方式", options=configured_pdf_formats,
         default=default_pdf_sync_formats, key="ingestion_selected_pdf_sync_formats"
     )
-    sync_col1, sync_col2, sync_col3, sync_col4, sync_col5 = st.columns(5)
+    sync_col1, sync_col2, sync_col3, sync_col4, sync_col5, sync_col6 = st.columns(6)
     if sync_col1.button("選択したPDF KBを同期", key="sync_selected_file_ingestion_kbs"):
         if not selected_pdf_sync_formats:
             st.error("同期するPDF比較方式を1つ以上選択してください。")
@@ -4599,9 +4800,18 @@ elif page == "🧪 データ取り込み検証":
         except Exception as exc:
             st.error(f"Word Knowledge Base同期エラー: {exc}")
             st.code(traceback.format_exc())
+    if sync_col6.button("PowerPoint 3KBを同期", key="sync_ppt_ingestion_kbs"):
+        for key in ["ingestion_ppt_sync_results", "ingestion_ppt_synced_config", "ingestion_ppt_evaluation"]:
+            st.session_state.pop(key, None)
+        try:
+            run_sync_group(INGESTION_PPT_FORMATS, "ingestion_ppt_sync_results",
+                           "ingestion_ppt_synced_config")
+        except Exception as exc:
+            st.error(f"PowerPoint Knowledge Base同期エラー: {exc}")
+            st.code(traceback.format_exc())
     for state_key in [
         "ingestion_file_sync_results", "ingestion_web_sync_results", "ingestion_excel_sync_results",
-        "ingestion_word_sync_results"
+        "ingestion_word_sync_results", "ingestion_ppt_sync_results"
     ]:
         if st.session_state.get(state_key):
             st.dataframe(pd.DataFrame(st.session_state[state_key]), use_container_width=True)
@@ -4756,7 +4966,15 @@ elif page == "🧪 データ取り込み検証":
 
     st.markdown("### 評価実験情報")
     latest_pdf_previews = st.session_state.get("ingestion_pdf_output", {}).get("previews", [])
-    default_source_pdf = latest_pdf_previews[0].get("source", "") if latest_pdf_previews else ""
+    latest_ppt_previews = st.session_state.get("ingestion_ppt_output", {}).get("previews", [])
+    latest_word_previews = st.session_state.get("ingestion_word_output", {}).get("previews", [])
+    latest_excel_workbooks = st.session_state.get("ingestion_excel_output", {}).get("workbooks", [])
+    default_source_pdf = (
+        (latest_pdf_previews[0].get("source", "") if latest_pdf_previews else "")
+        or (latest_ppt_previews[0].get("name", "") if latest_ppt_previews else "")
+        or (latest_word_previews[0].get("name", "") if latest_word_previews else "")
+        or (latest_excel_workbooks[0].get("original_name", "") if latest_excel_workbooks else "")
+    )
     if ("evaluation_source_pdf_name" not in st.session_state
             or not st.session_state.evaluation_source_pdf_name) and default_source_pdf:
         st.session_state.evaluation_source_pdf_name = default_source_pdf
@@ -4772,7 +4990,7 @@ elif page == "🧪 データ取り込み検証":
     experiment_col1, experiment_col2 = st.columns(2)
     experiment_name = experiment_col1.text_input("実験名", key="evaluation_experiment_name")
     source_pdf_name = experiment_col2.text_input(
-        "元PDF名", value=default_source_pdf, key="evaluation_source_pdf_name"
+        "元資料名", value=default_source_pdf, key="evaluation_source_pdf_name"
     )
     experiment_memo = st.text_area("実験メモ（任意）", key="evaluation_experiment_memo")
     experiment_col3, experiment_col4, experiment_col5 = st.columns(3)
@@ -4799,6 +5017,10 @@ elif page == "🧪 データ取り込み検証":
     word_chunking_confirmed = st.checkbox(
         "Word専用3KBが上記と同じChunking設定であることを確認しました",
         key="ingestion_word_chunking_confirmed"
+    )
+    ppt_chunking_confirmed = st.checkbox(
+        "PowerPoint専用3KBが上記と同じChunking設定であることを確認しました",
+        key="ingestion_ppt_chunking_confirmed"
     )
     force_new_evaluation = st.checkbox(
         "保存済みの途中結果を使わず、新規評価として開始する",
@@ -4923,10 +5145,10 @@ elif page == "🧪 データ取り込み検証":
                 st.warning("評価処理は継続しましたが、一部の途中保存に失敗しました。")
             if output_state == "ingestion_file_evaluation":
                 st.session_state.current_ingestion_evaluation_results = st.session_state[output_state]
-                st.session_state.pop("saved_evaluation_experiment_id", None)
-                st.session_state.pop("evaluation_history_save_results", None)
+            st.session_state.pop(f"saved_evaluation_experiment_id_{output_state}", None)
+            st.session_state.pop(f"evaluation_history_save_results_{output_state}", None)
 
-    eval_col1, eval_col2, eval_col3, eval_col4 = st.columns(4)
+    eval_col1, eval_col2, eval_col3, eval_col4, eval_col5 = st.columns(5)
     if eval_col1.button("ファイルRetrieve比較を実行", type="primary", key="run_file_ingestion_evaluation"):
         try:
             run_evaluation_group(INGESTION_FILE_FORMATS, "ingestion_file_evaluation",
@@ -4955,12 +5177,20 @@ elif page == "🧪 データ取り込み検証":
         except Exception as exc:
             st.error(f"Word Retrieve / 回答生成エラー: {exc}")
             st.code(traceback.format_exc())
+    if eval_col5.button("PowerPoint Retrieve比較を実行", type="primary", key="run_ppt_ingestion_evaluation"):
+        try:
+            run_evaluation_group(INGESTION_PPT_FORMATS, "ingestion_ppt_evaluation",
+                                 ppt_chunking_confirmed)
+        except Exception as exc:
+            st.error(f"PowerPoint Retrieve / 回答生成エラー: {exc}")
+            st.code(traceback.format_exc())
 
     for evaluation_state, label, detail_prefix, comparison_prefix in [
         ("ingestion_file_evaluation", "ファイル", "ingestion_file_retrieval_detail", "ingestion_file_comparison"),
         ("ingestion_web_evaluation", "Web", "ingestion_web_retrieval_detail", "ingestion_web_comparison"),
         ("ingestion_excel_evaluation", "Excel", "ingestion_excel_retrieval_detail", "ingestion_excel_comparison"),
-        ("ingestion_word_evaluation", "Word", "ingestion_word_retrieval_detail", "ingestion_word_comparison")
+        ("ingestion_word_evaluation", "Word", "ingestion_word_retrieval_detail", "ingestion_word_comparison"),
+        ("ingestion_ppt_evaluation", "PowerPoint", "ingestion_ppt_retrieval_detail", "ingestion_ppt_comparison")
     ]:
         if not st.session_state.get(evaluation_state):
             continue
@@ -5080,7 +5310,8 @@ elif page == "🧪 データ取り込み検証":
             st.session_state[evaluation_state] = evaluation
             if evaluation_state == "ingestion_file_evaluation":
                 st.session_state.current_ingestion_evaluation_results = evaluation
-                st.session_state.pop("saved_evaluation_experiment_id", None)
+            st.session_state.pop(f"saved_evaluation_experiment_id_{evaluation_state}", None)
+            st.session_state.pop(f"evaluation_history_save_results_{evaluation_state}", None)
             st.success("手動レビューを反映しました。履歴保存時はmanual_review.csvへも保存します。")
 
         if not category_summary.empty:
@@ -5137,58 +5368,62 @@ elif page == "🧪 データ取り込み検証":
                 key=f"download_{comparison_prefix}_difficulty_summary"
             )
 
-        if evaluation_state == "ingestion_file_evaluation":
-            st.markdown("### 評価結果のS3保存")
-            experiment_info = evaluation.get("experiment_info", {})
-            save_formats = list(dict.fromkeys(comparison_df["ingestion_format"].astype(str)))
-            save_preview = {
-                "実験名": experiment_info.get("experiment_name", ""),
-                "元PDF名": experiment_info.get("source_pdf_name", ""),
-                "質問数": int(comparison_df["question"].nunique()) if "question" in comparison_df else 0,
-                "対象方式": save_formats,
-                "保存先": f"s3://{ingestion_bucket}/{EVALUATION_HISTORY_PREFIX}<experiment_id>/"
-            }
-            st.json(save_preview)
-            already_saved = bool(st.session_state.get("saved_evaluation_experiment_id"))
-            if st.button(
-                "この評価結果をS3へ保存", type="primary",
-                disabled=already_saved, key="save_file_evaluation_history"
-            ):
-                if not ingestion_bucket.strip():
-                    st.error("S3バケット名が未設定です。")
-                elif not experiment_info.get("experiment_name", "").strip():
-                    st.error("実験名を入力してください。")
-                else:
-                    experiment_id = generate_evaluation_experiment_id()
-                    metadata = build_evaluation_history_metadata(
-                        experiment_id, experiment_info, evaluation, ingestion_test_config,
-                        evaluation_model.strip(), evaluation_model.strip(),
-                        evaluation_max_tokens, evaluation_top_k
-                    )
-                    files = build_evaluation_history_files(
-                        evaluation, evaluation.get("questions_snapshot", pd.DataFrame()),
-                        collect_pdf_conversion_metrics(st.session_state.get("ingestion_pdf_output", {}))
-                    )
-                    save_rows = save_evaluation_history(
-                        ingestion_bucket.strip(), experiment_id, metadata, files
-                    )
-                    st.session_state.evaluation_history_save_results = save_rows
-                    if all(row["結果"] == "成功" for row in save_rows):
-                        st.session_state.saved_evaluation_experiment_id = experiment_id
-                        st.success(
-                            f"実験ID {experiment_id} として保存しました: "
-                            f"s3://{ingestion_bucket}/{EVALUATION_HISTORY_PREFIX}{experiment_id}/"
-                        )
-                        st.session_state.pop("evaluation_history_list", None)
-                    else:
-                        st.error("一部ファイルの保存に失敗したため、実験はINCOMPLETEです。")
-            if already_saved:
-                st.info(f"保存済み実験ID: {st.session_state.saved_evaluation_experiment_id}")
-            if st.session_state.get("evaluation_history_save_results"):
-                st.dataframe(
-                    pd.DataFrame(st.session_state.evaluation_history_save_results),
-                    use_container_width=True
+        st.markdown("### 評価結果のS3保存")
+        experiment_info = evaluation.get("experiment_info", {})
+        save_formats = list(dict.fromkeys(comparison_df["ingestion_format"].astype(str)))
+        save_preview = {
+            "評価種別": label,
+            "実験名": experiment_info.get("experiment_name", ""),
+            "元資料名": experiment_info.get("source_pdf_name", ""),
+            "質問数": int(comparison_df["question"].nunique()) if "question" in comparison_df else 0,
+            "対象方式": save_formats,
+            "保存先": f"s3://{ingestion_bucket}/{EVALUATION_HISTORY_PREFIX}<experiment_id>/"
+        }
+        st.json(save_preview)
+        saved_id_key = f"saved_evaluation_experiment_id_{evaluation_state}"
+        save_results_key = f"evaluation_history_save_results_{evaluation_state}"
+        already_saved = bool(st.session_state.get(saved_id_key))
+        if st.button(
+            f"この{label}評価結果をS3へ保存", type="primary",
+            disabled=already_saved, key=f"save_evaluation_history_{evaluation_state}"
+        ):
+            if not ingestion_bucket.strip():
+                st.error("S3バケット名が未設定です。")
+            elif not experiment_info.get("experiment_name", "").strip():
+                st.error("実験名を入力してください。")
+            else:
+                experiment_id = generate_evaluation_experiment_id()
+                metadata = build_evaluation_history_metadata(
+                    experiment_id, experiment_info, evaluation, ingestion_test_config,
+                    evaluation_model.strip(), evaluation_model.strip(),
+                    evaluation_max_tokens, evaluation_top_k
                 )
+                metadata["evaluation_type"] = evaluation_state
+                conversion_metrics = (
+                    collect_pdf_conversion_metrics(st.session_state.get("ingestion_pdf_output", {}))
+                    if evaluation_state == "ingestion_file_evaluation" else {}
+                )
+                files = build_evaluation_history_files(
+                    evaluation, evaluation.get("questions_snapshot", pd.DataFrame()),
+                    conversion_metrics
+                )
+                save_rows = save_evaluation_history(
+                    ingestion_bucket.strip(), experiment_id, metadata, files
+                )
+                st.session_state[save_results_key] = save_rows
+                if all(row["結果"] == "成功" for row in save_rows):
+                    st.session_state[saved_id_key] = experiment_id
+                    st.success(
+                        f"実験ID {experiment_id} として保存しました: "
+                        f"s3://{ingestion_bucket}/{EVALUATION_HISTORY_PREFIX}{experiment_id}/"
+                    )
+                    st.session_state.pop("evaluation_history_list", None)
+                else:
+                    st.error("一部ファイルの保存に失敗したため、実験はINCOMPLETEです。")
+        if already_saved:
+            st.info(f"保存済み実験ID: {st.session_state[saved_id_key]}")
+        if st.session_state.get(save_results_key):
+            st.dataframe(pd.DataFrame(st.session_state[save_results_key]), use_container_width=True)
 
     st.divider()
     st.header("評価結果履歴")

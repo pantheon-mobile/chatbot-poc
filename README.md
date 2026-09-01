@@ -106,6 +106,12 @@ word_txt_knowledge_base_id = "YOUR_WORD_TXT_KB_ID"
 word_txt_data_source_id = "YOUR_WORD_TXT_DATA_SOURCE_ID"
 word_markdown_knowledge_base_id = "YOUR_WORD_MARKDOWN_KB_ID"
 word_markdown_data_source_id = "YOUR_WORD_MARKDOWN_DATA_SOURCE_ID"
+ppt_pptx_knowledge_base_id = "YOUR_PPT_PPTX_KB_ID"
+ppt_pptx_data_source_id = "YOUR_PPT_PPTX_DATA_SOURCE_ID"
+ppt_txt_knowledge_base_id = "YOUR_PPT_TXT_KB_ID"
+ppt_txt_data_source_id = "YOUR_PPT_TXT_DATA_SOURCE_ID"
+ppt_markdown_knowledge_base_id = "YOUR_PPT_MARKDOWN_KB_ID"
+ppt_markdown_data_source_id = "YOUR_PPT_MARKDOWN_DATA_SOURCE_ID"
 ```
 
 管理・追跡用正本は次の構成です。
@@ -129,6 +135,9 @@ EXCEL_MARKDOWN: documents/ingestion-test/kb-source/excel-markdown/
 WORD_DOCX:      documents/ingestion-test/kb-source/word-docx/
 WORD_TXT:       documents/ingestion-test/kb-source/word-txt/
 WORD_MARKDOWN:  documents/ingestion-test/kb-source/word-markdown/
+PPT_PPTX:       documents/ingestion-test/kb-source/ppt-pptx/
+PPT_TXT:        documents/ingestion-test/kb-source/ppt-txt/
+PPT_MARKDOWN:   documents/ingestion-test/kb-source/ppt-markdown/
 ```
 
 各比較グループのData Sourceはすべて `Hierarchical Chunking`、Parent 1500 tokens、Child 300 tokens、
